@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: statuszap_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: statuszap_user
+      POSTGRES_PASSWORD: changeme_local_only
+      POSTGRES_DB: statuszap_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U statuszap_user -d statuszap_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: .
+    container_name: statuszap_backend
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://statuszap_user:changeme_local_only@db:5432/statuszap_db}
+    ports:
+      - "8000:8000"
+
+volumes:
+  postgres_data:
