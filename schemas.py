@@ -19,6 +19,20 @@ class OtpVerifyRequest(BaseModel):
     phone_e164: str
     code: str = Field(..., min_length=4, max_length=8)
 
+class LoginRequest(BaseModel):
+    phone_e164: str = Field(..., description="Telefone com código do país (ex: +5511999998888)")
+    password: str = Field(..., min_length=4, max_length=128, description="Senha de acesso")
+
+    @field_validator("phone_e164")
+    @classmethod
+    def validate_phone(cls, v: str) -> str:
+        clean = v.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+        if not clean.startswith("+"):
+            clean = "+" + clean
+        if len(clean) < 10 or len(clean) > 20:
+            raise ValueError("Número de telefone inválido.")
+        return clean
+
 class UserRegisterRequest(BaseModel):
     name: str = Field(..., min_length=2, max_length=100)
     phone_e164: str

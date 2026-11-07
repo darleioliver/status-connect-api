@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import engine, Base, get_db
 from models import User, ContactExchange, OtpVerification, Report, AuditLog
 from schemas import (
-    OtpRequest, OtpVerifyRequest, UserRegisterRequest, UserResponse,
+    OtpRequest, OtpVerifyRequest, LoginRequest, UserRegisterRequest, UserResponse,
     ContactDto, ExchangeRequest, ExchangeBatchResponse, StatsResponse,
     PrivacyUpdateRequest, ReportRequest, MarkBatchAddedRequest
 )
@@ -100,6 +100,42 @@ async def verify_otp_endpoint(payload: OtpVerifyRequest, db: AsyncSession = Depe
             detail="Código de verificação incorreto ou expirado."
         )
     return {"success": True, "message": "Telefone verificado com sucesso."}
+
+@app.post("/api/v1/auth/login", response_model=UserResponse, tags=["Autenticação & OTP"])
+async def login_user(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
+    stmt = select(User).where(User.phone_e164 == payload.phone_e164)
+    user = (await db.execute(stmt)).scalars().first()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Nenhuma conta encontrada com este número de WhatsApp. Cadastre-se primeiro."
+        )
+    
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Esta conta foi desativada ou excluída. Realize um novo cadastro para reativar."
+        )
+    
+    pwd_hash = hashlib.sha256(payload.password.encode()).hexdigest()
+    if user.password_hash and user.password_hash != pwd_hash:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Senha incorreta. Verifique os dados digitados."
+        )
+        
+    audit = AuditLog(
+        user_id=user.id,
+        action="USER_LOGIN_SUCCESS",
+        timestamp=datetime.datetime.utcnow(),
+        details=f"Login realizado com sucesso para o usuário {user.name} ({user.phone_e164})."
+    )
+    db.add(audit)
+    await db.commit()
+    await db.refresh(user)
+    
+    return user
 
 # --- Cadastro de Usuários (LGPD & Anti-Duplicação) ---
 
