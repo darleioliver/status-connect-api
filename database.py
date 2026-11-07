@@ -3,9 +3,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from sqlalchemy.orm import declarative_base
 
 # Suporte automático a PostgreSQL (Produção) com fallback para SQLite assíncrono (Dev/Teste)
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL não definida. Configure a referência do PostgreSQL no Railway.")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./statuszap.db")
 
 # Ajuste automático se a URL do Postgres vier como postgres:// (comum no Heroku/Railway)
 if DATABASE_URL.startswith("postgres://"):

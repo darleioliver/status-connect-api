@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 from contextlib import asynccontextmanager
 from typing import List
 from fastapi import FastAPI, Depends, HTTPException, Query, status
@@ -26,6 +27,9 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
     
     # Popula contatos iniciais da comunidade se estiver vazio
+    from database import AsyncSessionLocal
+    async with AsyncSessionLocal() as session:
+        await seed_initial_community_pool(session)
     
     yield
     # Limpeza de conexões
@@ -112,6 +116,10 @@ async def register_user(payload: UserRegisterRequest, db: AsyncSession = Depends
     # 2. Impedir contas duplicadas (Regra de Negócio: Cada número possui somente 1 conta)
     stmt = select(User).where(User.phone_e164 == payload.phone_e164)
     existing_user = (await db.execute(stmt)).scalars().first()
+    pwd_hash = hashlib.sha256(payload.password.encode()).hexdigest()
+    user_state = (payload.state or "").strip().upper()
+    user_gender = (payload.gender or "").strip()
+
     if existing_user:
         if not existing_user.is_active:
             # Reativa se foi deletada previamente
@@ -119,6 +127,9 @@ async def register_user(payload: UserRegisterRequest, db: AsyncSession = Depends
             existing_user.is_paused = False
             existing_user.name = payload.name
             existing_user.bio = payload.bio or existing_user.bio
+            existing_user.state = user_state or existing_user.state
+            existing_user.gender = user_gender or existing_user.gender
+            existing_user.password_hash = pwd_hash
             existing_user.consented_at = datetime.datetime.utcnow()
             await db.commit()
             await db.refresh(existing_user)
@@ -135,6 +146,9 @@ async def register_user(payload: UserRegisterRequest, db: AsyncSession = Depends
         phone_e164=payload.phone_e164,
         country_code=payload.country_code,
         bio=payload.bio or "Status do WhatsApp",
+        state=user_state,
+        gender=user_gender,
+        password_hash=pwd_hash,
         consented_at=now,
         terms_accepted=True,
         is_active=True,
@@ -154,7 +168,7 @@ async def register_user(payload: UserRegisterRequest, db: AsyncSession = Depends
         user_id=new_user.id,
         action="USER_REGISTERED_CONSENT_GIVEN",
         timestamp=now,
-        details=f"Usuário {new_user.name} ({new_user.phone_e164}) aceitou termos e autorizou compartilhamento consentido."
+        details=f"Usuário {new_user.name} ({new_user.phone_e164}) UF={new_user.state} Sexo={new_user.gender} aceitou termos e autorizou compartilhamento."
     )
     db.add(audit)
     await db.commit()

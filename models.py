@@ -13,6 +13,9 @@ class User(Base):
     phone_e164 = Column(String(32), unique=True, index=True, nullable=False)
     country_code = Column(String(10), default="+55", nullable=False)
     bio = Column(String(200), default="", nullable=True) # Ex: nicho ou interesse (Empreendedorismo, etc)
+    state = Column(String(10), default="", nullable=True) # UF (ex: SP, RJ, MG)
+    gender = Column(String(30), default="", nullable=True) # Feminino, Masculino, etc
+    password_hash = Column(String(255), default="", nullable=True) # Senha criptografada do usuário
     consented_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     terms_accepted = Column(Boolean, default=True, nullable=False)
     is_active = Column(Boolean, default=True, index=True, nullable=False)

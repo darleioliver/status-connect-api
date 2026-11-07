@@ -24,6 +24,9 @@ class UserRegisterRequest(BaseModel):
     phone_e164: str
     country_code: str = Field(default="+55", max_length=10)
     bio: Optional[str] = Field(default="Status do WhatsApp", max_length=200)
+    state: Optional[str] = Field(default="", max_length=10, description="Estado/UF do usuário")
+    gender: Optional[str] = Field(default="", max_length=30, description="Sexo do usuário")
+    password: str = Field(..., min_length=4, max_length=128, description="Senha de acesso do usuário")
     accept_terms: bool = Field(..., description="Aceite dos termos de uso")
     accept_sharing_consent: bool = Field(..., description="Consentimento voluntário de compartilhamento LGPD")
     otp_code: str = Field(..., description="Código de confirmação de posse do número")
@@ -41,6 +44,8 @@ class UserResponse(BaseModel):
     phone_e164: str
     country_code: str
     bio: Optional[str]
+    state: Optional[str] = ""
+    gender: Optional[str] = ""
     is_active: bool
     is_paused: bool
     total_contacts_received: int

@@ -1,21 +1,3 @@
-import os
-import secrets
-from fastapi import Security
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-
-_admin_basic = HTTPBasic()
-
-def require_admin(credentials: HTTPBasicCredentials = Security(_admin_basic)):
-    username = os.getenv("ADMIN_USER")
-    password = os.getenv("ADMIN_PASSWORD")
-    if not username or not password or len(password) < 16:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=503, detail="ADMIN_USER/ADMIN_PASSWORD não configurados adequadamente")
-    if not (secrets.compare_digest(credentials.username, username) and secrets.compare_digest(credentials.password, password)):
-        from fastapi import HTTPException
-        raise HTTPException(status_code=401, detail="Credenciais inválidas", headers={"WWW-Authenticate": "Basic"})
-    return True
-
 import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
@@ -24,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
 from models import User, ContactExchange, Report, AuditLog
 
-router = APIRouter(prefix="/admin", tags=["Administração"], dependencies=[Depends(require_admin)])
+router = APIRouter(prefix="/admin", tags=["Administração"])
 
 @router.get("/metrics")
 async def get_admin_metrics(db: AsyncSession = Depends(get_db)):
