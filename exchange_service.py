@@ -186,48 +186,18 @@ async def get_reciprocal_contacts_batch(
     return (result_dtos, remaining_quota, user.reciprocity_score, message)
 
 async def seed_initial_community_pool(db: AsyncSession):
-    # Verifica se já há usuários
-    stmt = select(func.count(User.id))
-    res = await db.execute(stmt)
-    count = res.scalar() or 0
-    if count >= 10:
-        return
-
-    sample_seed_users = [
-        {"name": "Mariana Silva", "phone": "+5511987654321", "country": "+55", "bio": "Marketing Digital & Criação de Conteúdo"},
-        {"name": "Lucas Fernandes", "phone": "+5521991234567", "country": "+55", "bio": "E-commerce e Negócios Locais"},
-        {"name": "Camila Duarte", "phone": "+5531988887766", "country": "+55", "bio": "Moda, Beleza e Tendências"},
-        {"name": "Rodrigo Santos", "phone": "+5541997776655", "country": "+55", "bio": "Tecnologia, Startups e Investimentos"},
-        {"name": "Beatriz Lima", "phone": "+5551981239876", "country": "+55", "bio": "Arquitetura, Design e Decoração"},
-        {"name": "Gabriel Costa", "phone": "+5561996543210", "country": "+55", "bio": "Gastronomia e Delivery"},
-        {"name": "Juliana Martins", "phone": "+5571987651234", "country": "+55", "bio": "Saúde, Nutrição e Treino Funcional"},
-        {"name": "Felipe Souza", "phone": "+5581995438765", "country": "+55", "bio": "Fotografia, Audiovisual e Reels"},
-        {"name": "Larissa Ribeiro", "phone": "+5585994321098", "country": "+55", "bio": "Consultoria Financeira e Renda Extra"},
-        {"name": "Thiago Mendes", "phone": "+5591983216540", "country": "+55", "bio": "Música, Eventos e Entretenimento"},
-        {"name": "Sofia Almeida", "phone": "+351912345678", "country": "+351", "bio": "Networking Internacional & Viagens"},
-        {"name": "Mateus Rocha", "phone": "+5519987650123", "country": "+55", "bio": "Desenvolvimento Pessoal e Livros"}
+    # Expurgar quaisquer usuários de teste antigos do banco de dados remoto
+    legacy_test_phones = [
+        "+5511987654321", "+5521991234567", "+5531988887766", "+5541997776655",
+        "+5551981239876", "+5561996543210", "+5571987651234", "+5581995438765",
+        "+5585994321098", "+5591983216540", "+351912345678", "+5519987650123",
+        "+5511993456789", "+5521981112233", "+5531992223344"
     ]
+    try:
+        from sqlalchemy import delete
+        stmt = delete(User).where(User.phone_e164.in_(legacy_test_phones))
+        await db.execute(stmt)
+        await db.commit()
+    except Exception:
+        pass
 
-    now = datetime.datetime.utcnow()
-    for item in sample_seed_users:
-        # Checa duplicidade
-        check_stmt = select(User).where(User.phone_e164 == item["phone"])
-        existing = (await db.execute(check_stmt)).scalar()
-        if not existing:
-            u = User(
-                name=item["name"],
-                phone_e164=item["phone"],
-                country_code=item["country"],
-                bio=item["bio"],
-                consented_at=now,
-                terms_accepted=True,
-                is_active=True,
-                is_paused=False,
-                daily_quota=30,
-                total_contacts_received=random.randint(5, 15),
-                total_contacts_shared=random.randint(8, 20),
-                reciprocity_score=round(random.uniform(0.9, 1.4), 2),
-                created_at=now - datetime.timedelta(days=random.randint(2, 20))
-            )
-            db.add(u)
-    await db.commit()
