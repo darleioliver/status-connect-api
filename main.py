@@ -61,6 +61,43 @@ async def health_check():
         "timestamp": datetime.datetime.utcnow().isoformat()
     }
 
+@app.get("/api/v1/network/summary", tags=["Rede"])
+async def get_network_summary(db: AsyncSession = Depends(get_db)):
+    active_stmt = select(func.count(User.id)).where(User.is_active == True, User.is_paused == False)
+    active_count = (await db.execute(active_stmt)).scalar() or 0
+    total_stmt = select(func.count(User.id))
+    total_count = (await db.execute(total_stmt)).scalar() or 0
+    exchange_stmt = select(func.count(ContactExchange.id))
+    total_exchanges = (await db.execute(exchange_stmt)).scalar() or 0
+
+    return {
+        "total_active_participants": active_count,
+        "total_participants": total_count,
+        "total_exchanges": total_exchanges
+    }
+
+@app.get("/api/v1/network/public-contacts", response_model=List[ContactDto], tags=["Rede"])
+async def get_public_network_contacts(
+    limit: int = 25,
+    db: AsyncSession = Depends(get_db)
+):
+    stmt = select(User).where(
+        User.is_active == True,
+        User.is_paused == False
+    ).order_by(User.id.asc()).limit(limit)
+    users = (await db.execute(stmt)).scalars().all()
+    return [
+        ContactDto(
+            user_id=u.id,
+            name=u.name,
+            phone_e164=u.phone_e164,
+            country_code=u.country_code,
+            bio=u.bio,
+            added_to_device=False
+        )
+        for u in users
+    ]
+
 # --- OTP & Verificação Segura ---
 
 @app.post("/api/v1/otp/request", tags=["Autenticação & OTP"])
