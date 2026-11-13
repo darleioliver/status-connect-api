@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from typing import List
 from fastapi import FastAPI, Depends, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select, func, and_, update
+from sqlalchemy import select, func, and_, update, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import engine, Base, get_db
@@ -16,20 +16,36 @@ from schemas import (
 )
 from exchange_service import (
     generate_and_store_otp, verify_otp, get_reciprocal_contacts_batch,
-    seed_initial_community_pool
+    seed_initial_community_pool, pause_expired_free_users, brasilia_today_str
 )
 from admin import router as admin_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Inicializa as tabelas do banco no startup
+    # Inicializa as tabelas do banco no startup e garante colunas novas sem apagar dados
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        for sql_stmt in [
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_premium BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_date VARCHAR(16) DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN is_premium BOOLEAN NOT NULL DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN last_active_date VARCHAR(16) DEFAULT ''"
+        ]:
+            try:
+                await conn.execute(text(sql_stmt))
+            except Exception:
+                pass
     
-    # Popula contatos iniciais da comunidade se estiver vazio
     from database import AsyncSessionLocal
     async with AsyncSessionLocal() as session:
         await seed_initial_community_pool(session)
+        today_str = brasilia_today_str()
+        await session.execute(
+            update(User)
+            .where((User.last_active_date == None) | (User.last_active_date == ""))
+            .values(last_active_date=today_str)
+        )
+        await session.commit()
     
     yield
     # Limpeza de conexões
@@ -63,6 +79,7 @@ async def health_check():
 
 @app.get("/api/v1/network/summary", tags=["Rede"])
 async def get_network_summary(db: AsyncSession = Depends(get_db)):
+    await pause_expired_free_users(db)
     active_stmt = select(func.count(User.id)).where(User.is_active == True, User.is_paused == False)
     active_count = (await db.execute(active_stmt)).scalar() or 0
     total_stmt = select(func.count(User.id))
@@ -78,21 +95,33 @@ async def get_network_summary(db: AsyncSession = Depends(get_db)):
 
 @app.get("/api/v1/network/public-contacts", response_model=List[ContactDto], tags=["Rede"])
 async def get_public_network_contacts(
-    limit: int = 25,
+    limit: int = 100,
     db: AsyncSession = Depends(get_db)
 ):
-    stmt = select(User).where(
-        User.is_active == True,
-        User.is_paused == False
-    ).order_by(User.id.asc()).limit(limit)
+    await pause_expired_free_users(db)
+    stmt = (
+        select(User)
+        .where(
+            User.is_active == True,
+            User.is_paused == False
+        )
+        .order_by(User.is_premium.desc(), User.id.asc())
+        .limit(limit)
+    )
     users = (await db.execute(stmt)).scalars().all()
+    now = datetime.datetime.utcnow()
     return [
         ContactDto(
+            id=u.id,
             user_id=u.id,
             name=u.name,
             phone_e164=u.phone_e164,
             country_code=u.country_code,
-            bio=u.bio,
+            bio=u.bio or "Status do WhatsApp",
+            state=u.state or "",
+            gender=u.gender or "",
+            is_premium=bool(u.is_premium),
+            distributed_at=u.created_at or now,
             added_to_device=False
         )
         for u in users
@@ -162,6 +191,9 @@ async def login_user(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
             detail="Senha incorreta. Verifique os dados digitados."
         )
         
+    await pause_expired_free_users(db)
+    await db.refresh(user)
+
     audit = AuditLog(
         user_id=user.id,
         action="USER_LOGIN_SUCCESS",
@@ -198,6 +230,7 @@ async def register_user(payload: UserRegisterRequest, db: AsyncSession = Depends
             # Reativa se foi deletada previamente
             existing_user.is_active = True
             existing_user.is_paused = False
+            existing_user.last_active_date = brasilia_today_str()
             existing_user.name = payload.name
             existing_user.bio = payload.bio or existing_user.bio
             existing_user.state = user_state or existing_user.state
@@ -226,6 +259,8 @@ async def register_user(payload: UserRegisterRequest, db: AsyncSession = Depends
         terms_accepted=True,
         is_active=True,
         is_paused=False,
+        is_premium=False,
+        last_active_date=brasilia_today_str(),
         daily_quota=20,
         total_contacts_received=0,
         total_contacts_shared=0,
@@ -251,6 +286,7 @@ async def register_user(payload: UserRegisterRequest, db: AsyncSession = Depends
 
 @app.get("/api/v1/users/{user_id}", response_model=UserResponse, tags=["Usuários"])
 async def get_user_profile(user_id: int, db: AsyncSession = Depends(get_db)):
+    await pause_expired_free_users(db)
     user = await db.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="Usuário não encontrado.")
@@ -258,6 +294,7 @@ async def get_user_profile(user_id: int, db: AsyncSession = Depends(get_db)):
 
 @app.get("/api/v1/users/{user_id}/stats", response_model=StatsResponse, tags=["Métricas & Estatísticas"])
 async def get_user_stats(user_id: int, db: AsyncSession = Depends(get_db)):
+    await pause_expired_free_users(db)
     user = await db.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="Usuário não encontrado.")
@@ -285,7 +322,8 @@ async def get_user_stats(user_id: int, db: AsyncSession = Depends(get_db)):
         daily_quota_used=today_received,
         daily_quota_limit=user.daily_quota,
         is_paused=user.is_paused,
-        is_active=user.is_active
+        is_active=user.is_active,
+        is_premium=bool(user.is_premium)
     )
 
 # --- Troca Recíproca de Contatos ---
@@ -323,7 +361,7 @@ async def get_received_contacts(
         select(ContactExchange, User)
         .join(User, ContactExchange.contact_user_id == User.id)
         .where(ContactExchange.user_id == user_id)
-        .order_by(ContactExchange.distributed_at.desc())
+        .order_by(User.is_premium.desc(), ContactExchange.distributed_at.desc())
         .offset(offset)
         .limit(limit)
     )
@@ -338,6 +376,9 @@ async def get_received_contacts(
             phone_e164=contact_user.phone_e164,
             country_code=contact_user.country_code,
             bio=contact_user.bio or "Status do WhatsApp",
+            state=contact_user.state or "",
+            gender=contact_user.gender or "",
+            is_premium=bool(contact_user.is_premium),
             distributed_at=exchange.distributed_at,
             added_to_device=exchange.added_to_device
         )
@@ -375,6 +416,8 @@ async def update_privacy(
         raise HTTPException(status_code=404, detail="Usuário não encontrado.")
 
     user.is_paused = payload.is_paused
+    if not payload.is_paused:
+        user.last_active_date = brasilia_today_str()
     audit = AuditLog(
         user_id=user.id,
         action="DISTRIBUTION_PAUSED" if payload.is_paused else "DISTRIBUTION_RESUMED",
@@ -386,7 +429,7 @@ async def update_privacy(
     return {
         "success": True,
         "is_paused": user.is_paused,
-        "message": "Distribuição pausada com sucesso. Seu número não será entregue a novos participantes." if user.is_paused else "Distribuição reativada. Você voltará a participar da troca recíproca."
+        "message": "Distribuição pausada com sucesso. Seu número não será entregue a novos participantes." if user.is_paused else "Distribuição reativada para hoje! Você voltará a participar da troca recíproca."
     }
 
 @app.delete("/api/v1/users/{user_id}", tags=["Privacidade & LGPD"])

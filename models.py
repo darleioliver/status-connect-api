@@ -20,6 +20,8 @@ class User(Base):
     terms_accepted = Column(Boolean, default=True, nullable=False)
     is_active = Column(Boolean, default=True, index=True, nullable=False)
     is_paused = Column(Boolean, default=False, index=True, nullable=False)
+    is_premium = Column(Boolean, default=False, index=True, nullable=False)
+    last_active_date = Column(String(16), default="", nullable=True) # Data YYYY-MM-DD (Brasilia) da ultima ativacao
     daily_quota = Column(Integer, default=20, nullable=False)
     total_contacts_received = Column(Integer, default=0, nullable=False)
     total_contacts_shared = Column(Integer, default=0, nullable=False)

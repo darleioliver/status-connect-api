@@ -62,6 +62,7 @@ class UserResponse(BaseModel):
     gender: Optional[str] = ""
     is_active: bool
     is_paused: bool
+    is_premium: bool = False
     total_contacts_received: int
     total_contacts_shared: int
     reciprocity_score: float
@@ -71,17 +72,20 @@ class UserResponse(BaseModel):
         from_attributes = True
 
 class ContactDto(BaseModel):
-    id: int
+    id: int = 0
     user_id: int
     name: str
     phone_e164: str
     country_code: str
     bio: Optional[str] = ""
-    distributed_at: datetime.datetime
-    added_to_device: bool
+    state: Optional[str] = ""
+    gender: Optional[str] = ""
+    is_premium: bool = False
+    distributed_at: Optional[datetime.datetime] = None
+    added_to_device: bool = False
 
 class ExchangeRequest(BaseModel):
-    batch_size: int = Field(default=10, ge=1, le=50)
+    batch_size: int = Field(default=10, ge=1, le=100)
 
 class ExchangeBatchResponse(BaseModel):
     contacts: List[ContactDto]
@@ -99,6 +103,7 @@ class StatsResponse(BaseModel):
     daily_quota_limit: int
     is_paused: bool
     is_active: bool
+    is_premium: bool = False
 
 class PrivacyUpdateRequest(BaseModel):
     is_paused: bool
@@ -116,9 +121,12 @@ class AdminUserDto(BaseModel):
     name: str
     phone_e164: str
     country_code: str
+    state: Optional[str] = ""
+    gender: Optional[str] = ""
     is_active: bool
     is_paused: bool
-    total_contacts_received: int
-    total_contacts_shared: int
+    is_premium: bool = False
+    total_received: int
+    total_shared: int
     reciprocity_score: float
     created_at: datetime.datetime

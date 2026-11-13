@@ -5,13 +5,16 @@ from sqlalchemy import select, func, desc, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
 from models import User, ContactExchange, Report, AuditLog
+from exchange_service import pause_expired_free_users
 
 router = APIRouter(prefix="/admin", tags=["Administração"])
 
 @router.get("/metrics")
 async def get_admin_metrics(db: AsyncSession = Depends(get_db)):
+    await pause_expired_free_users(db)
     total_users = (await db.execute(select(func.count(User.id)))).scalar() or 0
     active_users = (await db.execute(select(func.count(User.id)).where(User.is_active == True, User.is_paused == False))).scalar() or 0
+    premium_users = (await db.execute(select(func.count(User.id)).where(User.is_active == True, User.is_premium == True))).scalar() or 0
     total_exchanges = (await db.execute(select(func.count(ContactExchange.id)))).scalar() or 0
     
     # Exchanged today
@@ -24,6 +27,7 @@ async def get_admin_metrics(db: AsyncSession = Depends(get_db)):
     return {
         "total_users": total_users,
         "active_users": active_users,
+        "premium_users": premium_users,
         "total_exchanges": total_exchanges,
         "today_exchanges": today_exchanges,
         "pending_reports": pending_reports,
@@ -33,14 +37,15 @@ async def get_admin_metrics(db: AsyncSession = Depends(get_db)):
 @router.get("/users")
 async def list_admin_users(
     search: str = Query(default=""),
-    limit: int = 50,
+    limit: int = 100,
     offset: int = 0,
     db: AsyncSession = Depends(get_db)
 ):
+    await pause_expired_free_users(db)
     query = select(User)
     if search:
         query = query.where(User.name.ilike(f"%{search}%") | User.phone_e164.ilike(f"%{search}%"))
-    query = query.order_by(desc(User.created_at)).offset(offset).limit(limit)
+    query = query.order_by(desc(User.is_premium), desc(User.created_at)).offset(offset).limit(limit)
     res = await db.execute(query)
     users = res.scalars().all()
     
@@ -51,8 +56,11 @@ async def list_admin_users(
             "phone_e164": u.phone_e164,
             "country_code": u.country_code,
             "bio": u.bio,
+            "state": u.state or "",
+            "gender": u.gender or "",
             "is_active": u.is_active,
             "is_paused": u.is_paused,
+            "is_premium": bool(u.is_premium),
             "total_received": u.total_contacts_received,
             "total_shared": u.total_contacts_shared,
             "reciprocity_score": u.reciprocity_score,
@@ -60,6 +68,27 @@ async def list_admin_users(
         }
         for u in users
     ]
+
+@router.post("/users/{user_id}/toggle-premium")
+async def toggle_user_premium(user_id: int, db: AsyncSession = Depends(get_db)):
+    user = await db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+    user.is_premium = not bool(user.is_premium)
+    if user.is_premium:
+        user.is_paused = False
+    audit = AuditLog(
+        user_id=user.id,
+        action="PREMIUM_GRANTED" if user.is_premium else "PREMIUM_REVOKED",
+        timestamp=datetime.datetime.utcnow(),
+        details=f"Administrador alterou o plano de {user.name} para {'Premium' if user.is_premium else 'Grátis'}."
+    )
+    db.add(audit)
+    await db.commit()
+    return {
+        "is_premium": user.is_premium,
+        "message": f"Usuário agora é {'★ Premium' if user.is_premium else 'Grátis'}!"
+    }
 
 @router.post("/users/{user_id}/toggle-pause")
 async def toggle_user_pause(user_id: int, db: AsyncSession = Depends(get_db)):
@@ -150,11 +179,16 @@ async def admin_dashboard():
 
     <main class="max-w-7xl mx-auto p-6 space-y-8">
         <!-- Cards de Métricas -->
-        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-5">
             <div class="bg-slate-800/80 border border-slate-700/80 rounded-2xl p-5 shadow-sm">
                 <p class="text-xs font-medium text-slate-400 uppercase tracking-wider">Total de Usuários</p>
                 <p id="totalUsers" class="text-3xl font-bold text-white mt-2">--</p>
                 <p id="activeUsersRatio" class="text-xs text-emerald-400 mt-1">Carregando...</p>
+            </div>
+            <div class="bg-slate-800/80 border border-amber-500/40 rounded-2xl p-5 shadow-sm">
+                <p class="text-xs font-medium text-amber-400 uppercase tracking-wider">★ Assinantes Premium</p>
+                <p id="premiumUsers" class="text-3xl font-bold text-amber-300 mt-2">--</p>
+                <p class="text-xs text-slate-400 mt-1">Ativos 24h com filtros</p>
             </div>
             <div class="bg-slate-800/80 border border-slate-700/80 rounded-2xl p-5 shadow-sm">
                 <p class="text-xs font-medium text-slate-400 uppercase tracking-wider">Trocas Realizadas Hoje</p>
@@ -178,7 +212,7 @@ async def admin_dashboard():
             <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
                 <div>
                     <h2 class="text-lg font-semibold text-white">Participantes da Rede</h2>
-                    <p class="text-sm text-slate-400">Gerencie usuários, status de compartilhamento e conformidade</p>
+                    <p class="text-sm text-slate-400">Gerencie usuários, planos Premium/Grátis e status de compartilhamento</p>
                 </div>
                 <div class="flex items-center gap-3">
                     <input id="searchInput" type="text" placeholder="Buscar por nome ou WhatsApp..." 
@@ -196,9 +230,8 @@ async def admin_dashboard():
                         <tr>
                             <th class="py-3 px-4">Usuário</th>
                             <th class="py-3 px-4">WhatsApp (E.164)</th>
-                            <th class="py-3 px-4">Nicho / Bio</th>
-                            <th class="py-3 px-4">Recebidos</th>
-                            <th class="py-3 px-4">Compartilhados</th>
+                            <th class="py-3 px-4">UF / Sexo</th>
+                            <th class="py-3 px-4">Plano</th>
                             <th class="py-3 px-4">Reciprocidade</th>
                             <th class="py-3 px-4">Status</th>
                             <th class="py-3 px-4 text-right">Ações</th>
@@ -206,7 +239,7 @@ async def admin_dashboard():
                     </thead>
                     <tbody id="userTableBody" class="divide-y divide-slate-700/60">
                         <tr>
-                            <td colspan="8" class="text-center py-6 text-slate-500">Carregando participantes...</td>
+                            <td colspan="7" class="text-center py-6 text-slate-500">Carregando participantes...</td>
                         </tr>
                     </tbody>
                 </table>
@@ -221,6 +254,7 @@ async def admin_dashboard():
                 const data = await res.json();
                 document.getElementById('totalUsers').textContent = data.total_users;
                 document.getElementById('activeUsersRatio').textContent = `${data.active_users} ativos na rede`;
+                document.getElementById('premiumUsers').textContent = data.premium_users || 0;
                 document.getElementById('todayExchanges').textContent = data.today_exchanges;
                 document.getElementById('totalExchanges').textContent = `Total geral: ${data.total_exchanges}`;
                 document.getElementById('avgReciprocity').textContent = data.avg_reciprocity.toFixed(2);
@@ -237,21 +271,27 @@ async def admin_dashboard():
                 const res = await fetch(`/admin/users?search=${encodeURIComponent(search)}`);
                 const users = await res.json();
                 if (users.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="8" class="text-center py-6 text-slate-500">Nenhum participante encontrado.</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center py-6 text-slate-500">Nenhum participante encontrado.</td></tr>';
                     return;
                 }
                 tbody.innerHTML = users.map(u => `
-                    <tr class="hover:bg-slate-700/30 transition">
+                    <tr class="hover:bg-slate-700/30 transition ${u.is_premium ? 'bg-amber-500/5' : ''}">
                         <td class="py-3 px-4 font-medium text-white flex items-center gap-2">
-                            <span class="w-7 h-7 rounded-full bg-emerald-950 text-emerald-400 border border-emerald-700 flex items-center justify-center text-xs font-bold">
-                                ${u.name.charAt(0).toUpperCase()}
+                            <span class="w-7 h-7 rounded-full ${u.is_premium ? 'bg-amber-500/20 text-amber-300 border-amber-500' : 'bg-emerald-950 text-emerald-400 border-emerald-700'} border flex items-center justify-center text-xs font-bold">
+                                ${u.is_premium ? '★' : u.name.charAt(0).toUpperCase()}
                             </span>
-                            ${u.name}
+                            <div>
+                                <div>${u.name}</div>
+                                <div class="text-xs text-slate-400 truncate max-w-[160px]">${u.bio || 'Status do WhatsApp'}</div>
+                            </div>
                         </td>
                         <td class="py-3 px-4 text-emerald-400 font-mono text-xs">${u.phone_e164}</td>
-                        <td class="py-3 px-4 text-xs text-slate-400 max-w-xs truncate">${u.bio || 'Status do WhatsApp'}</td>
-                        <td class="py-3 px-4 font-semibold text-white">${u.total_received}</td>
-                        <td class="py-3 px-4 font-semibold text-white">${u.total_shared}</td>
+                        <td class="py-3 px-4 text-xs text-slate-300">${(u.state || '--')} • ${(u.gender || '--')}</td>
+                        <td class="py-3 px-4">
+                            ${u.is_premium
+                                ? '<span class="text-xs px-2.5 py-0.5 rounded-full font-bold bg-amber-500/20 text-amber-300 border border-amber-500/50">★ PREMIUM</span>'
+                                : '<span class="text-xs px-2.5 py-0.5 rounded-full bg-slate-700 text-slate-300">Grátis</span>'}
+                        </td>
                         <td class="py-3 px-4">
                             <span class="px-2 py-0.5 rounded text-xs font-semibold ${u.reciprocity_score >= 1.0 ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30' : 'bg-amber-500/10 text-amber-400 border border-amber-500/30'}">
                                 ${u.reciprocity_score.toFixed(2)}
@@ -262,7 +302,10 @@ async def admin_dashboard():
                               u.is_paused ? '<span class="text-xs px-2 py-0.5 rounded bg-amber-500/20 text-amber-300">Pausado</span>' :
                               '<span class="text-xs px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300">Ativo</span>'}
                         </td>
-                        <td class="py-3 px-4 text-right space-x-2">
+                        <td class="py-3 px-4 text-right space-x-1.5 whitespace-nowrap">
+                            <button onclick="togglePremium(${u.id})" class="text-xs px-2.5 py-1 rounded font-semibold ${u.is_premium ? 'bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40' : 'bg-amber-600 hover:bg-amber-500 text-slate-950'} transition">
+                                ${u.is_premium ? 'Remover Premium' : '★ Tornar Premium'}
+                            </button>
                             <button onclick="togglePause(${u.id})" class="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 transition">
                                 ${u.is_paused ? 'Reativar' : 'Pausar'}
                             </button>
@@ -273,8 +316,14 @@ async def admin_dashboard():
                     </tr>
                 `).join('');
             } catch(e) {
-                tbody.innerHTML = '<tr><td colspan="8" class="text-center py-6 text-rose-400">Erro ao buscar dados.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="7" class="text-center py-6 text-rose-400">Erro ao buscar dados.</td></tr>';
             }
+        }
+
+        async function togglePremium(id) {
+            await fetch(`/admin/users/${id}/toggle-premium`, { method: 'POST' });
+            loadUsers();
+            loadMetrics();
         }
 
         async function togglePause(id) {

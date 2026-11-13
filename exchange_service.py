@@ -7,6 +7,29 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models import User, ContactExchange, OtpVerification, AuditLog
 from schemas import ContactDto
 
+def brasilia_today_str() -> str:
+    return (datetime.datetime.utcnow() - datetime.timedelta(hours=3)).strftime("%Y-%m-%d")
+
+async def pause_expired_free_users(db: AsyncSession):
+    """Pausa automaticamente à meia-noite (Brasília) a distribuição de usuários do plano Grátis."""
+    today_str = brasilia_today_str()
+    from sqlalchemy import update
+    stmt = (
+        update(User)
+        .where(
+            User.is_active == True,
+            User.is_paused == False,
+            User.is_premium == False,
+            User.last_active_date != None,
+            User.last_active_date != "",
+            User.last_active_date != today_str
+        )
+        .values(is_paused=True)
+    )
+    res = await db.execute(stmt)
+    if res.rowcount and res.rowcount > 0:
+        await db.commit()
+
 def hash_code(code: str) -> str:
     return hashlib.sha256(code.strip().encode("utf-8")).hexdigest()
 
@@ -76,6 +99,8 @@ async def get_reciprocal_contacts_batch(
     user_id: int,
     batch_size: int = 10
 ) -> Tuple[List[ContactDto], int, float, str]:
+    await pause_expired_free_users(db)
+
     # 1. Carregar usuário solicitante
     user = await db.get(User, user_id)
     if not user:
@@ -94,12 +119,7 @@ async def get_reciprocal_contacts_batch(
     exchanged_res = await db.execute(exchanged_stmt)
     already_received_ids = set(exchanged_res.scalars().all())
 
-    # 3. Buscar candidatos disponíveis
-    # Regras:
-    # - Ativo e não pausado
-    # - Diferente do usuário
-    # - Nunca recebido antes
-    # - Ordenado pela menor quantidade de contatos compartilhados (equidade de distribuição)
+    # 3. Buscar candidatos disponíveis (priorizando contatos Premium)
     candidate_stmt = (
         select(User)
         .where(
@@ -110,8 +130,8 @@ async def get_reciprocal_contacts_batch(
                 not_(User.id.in_(already_received_ids)) if already_received_ids else True
             )
         )
-        .order_by(User.total_contacts_shared.asc(), User.reciprocity_score.desc())
-        .limit(batch_size * 2) # busca margem para randomização equitativa
+        .order_by(User.is_premium.desc(), User.total_contacts_shared.asc(), User.reciprocity_score.desc())
+        .limit(batch_size * 2)
     )
     candidate_res = await db.execute(candidate_stmt)
     candidates = candidate_res.scalars().all()
@@ -124,10 +144,12 @@ async def get_reciprocal_contacts_batch(
             "Você já recebeu todos os contatos ativos disponíveis no momento! Novos participantes cadastrados aparecerão aqui em breve."
         )
 
-    # Embaralhar candidatos com mesma prioridade para evitar envios viciados
-    selected = list(candidates)
-    random.shuffle(selected)
-    selected = selected[:batch_size]
+    # Mantém destaque dos Premium no topo e embaralha dentro do grupo
+    premium_candidates = [c for c in candidates if c.is_premium]
+    free_candidates = [c for c in candidates if not c.is_premium]
+    random.shuffle(premium_candidates)
+    random.shuffle(free_candidates)
+    selected = (premium_candidates + free_candidates)[:batch_size]
 
     now = datetime.datetime.utcnow()
     result_dtos: List[ContactDto] = []
@@ -158,6 +180,9 @@ async def get_reciprocal_contacts_batch(
                 phone_e164=contact_user.phone_e164,
                 country_code=contact_user.country_code,
                 bio=contact_user.bio or "Status do WhatsApp",
+                state=contact_user.state or "",
+                gender=contact_user.gender or "",
+                is_premium=bool(contact_user.is_premium),
                 distributed_at=now,
                 added_to_device=False
             )
