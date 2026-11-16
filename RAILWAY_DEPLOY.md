@@ -8,16 +8,20 @@ Este documento orienta a conexão do repositório `status-connect-api` ao seu pr
 
 ```
 backend/
-├── main.py               # Servidor FastAPI com ciclo de vida (startup tables + seeds)
-├── database.py           # Conexão assíncrona SQLAlchemy (suporta DATABASE_URL do Railway)
-├── models.py             # Modelos ORM (User, ContactExchange, OtpVerification, Report, AuditLog)
-├── schemas.py            # Schemas Pydantic v2
-├── exchange_service.py   # Algoritmo de troca recíproca e deduplicação estrita
-├── admin.py              # Painel Administrativo Web (/admin/dashboard)
-├── requirements.txt      # Dependências Python
-├── Procfile              # Comando de inicialização com porta dinâmica ($PORT)
-├── railway.json          # Configuração nativa para o Railway (Nixpacks)
-└── Dockerfile            # Fallback opcional para build via Docker
+├── main.py                        # Servidor FastAPI com ciclo de vida (startup tables + seeds)
+├── database.py                    # Conexão assíncrona SQLAlchemy (suporta DATABASE_URL do Railway)
+├── db_migrations.py               # Migração automática segura e idempotente (isolada por transação)
+├── migrations/
+│   └── 001_add_push_tables.sql    # SQL idempotente para PostgreSQL (device_tokens e push_campaigns)
+├── models.py                      # Modelos ORM (User, ContactExchange, DeviceToken, PushCampaign, etc.)
+├── schemas.py                     # Schemas Pydantic v2
+├── exchange_service.py            # Algoritmo de troca recíproca e deduplicação estrita
+├── push_service.py                # Integração Firebase Admin SDK (FCM)
+├── admin.py                       # Painel Administrativo Web (/admin/dashboard)
+├── requirements.txt               # Dependências Python (inclui sqlalchemy[asyncio], greenlet e firebase-admin)
+├── Procfile                       # Comando de inicialização com porta dinâmica ($PORT)
+├── railway.json                   # Configuração nativa para o Railway (Nixpacks)
+└── Dockerfile                     # Fallback opcional para build via Docker
 ```
 
 ---
@@ -52,12 +56,15 @@ Como o PostgreSQL já existe no seu projeto Railway:
 
 ---
 
-## 3. INICIALIZAÇÃO AUTOMÁTICA DAS TABELAS
+## 3. MIGRAÇÃO SEGURA E INICIALIZAÇÃO DAS TABELAS
 
-Você **NÃO** precisa rodar migrations manuais.
-Ao iniciar, o evento assíncrono `lifespan` do FastAPI em `main.py` executa automaticamente:
-1. `Base.metadata.create_all`: cria as tabelas `users`, `contact_exchanges`, `otp_verifications`, `reports` e `audit_logs` caso ainda não existam no seu PostgreSQL.
-2. `seed_initial_community_pool`: insere os participantes verificados iniciais para que a rede já tenha contatos disponíveis para troca recíproca imediata.
+Ao iniciar, o evento `lifespan` de `main.py` (e a guarda pré-consulta nas rotas `/admin/*` e `/api/v1/devices/fcm-token`) chama `ensure_push_tables_and_schema()`, criando `device_tokens` e `push_campaigns` com `CREATE TABLE IF NOT EXISTS` e índices em transações isoladas **sem apagar nem recriar a tabela `users`**.
+
+Caso queira executar manualmente no PostgreSQL do Railway:
+1. **Via SQL direto (Query / psql do Railway)**: execute o arquivo `migrations/001_add_push_tables.sql`.
+2. **Via Railway CLI no serviço da API**: `railway run python db_migrations.py`.
+
+Em seguida, `seed_initial_community_pool` garante os participantes iniciais caso o banco esteja vazio.
 
 ---
 

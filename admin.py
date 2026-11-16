@@ -6,6 +6,7 @@ from fastapi.responses import HTMLResponse
 from sqlalchemy import select, func, desc, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
+from db_migrations import ensure_push_tables
 from models import User, ContactExchange, Report, AuditLog, DeviceToken, PushCampaign
 from schemas import PushSendRequest
 from exchange_service import pause_expired_free_users
@@ -60,6 +61,7 @@ async def list_admin_users(
     offset: int = 0,
     db: AsyncSession = Depends(get_db)
 ):
+    await ensure_push_tables()
     await pause_expired_free_users(db)
     query = select(User)
     if search:
@@ -71,14 +73,19 @@ async def list_admin_users(
     user_ids = [u.id for u in users]
     token_counts = {}
     if user_ids:
-        tok_stmt = (
-            select(DeviceToken.user_id, func.count(DeviceToken.id))
-            .where(DeviceToken.is_active == True, DeviceToken.user_id.in_(user_ids))
-            .group_by(DeviceToken.user_id)
-        )
-        for uid, cnt in (await db.execute(tok_stmt)).all():
-            if uid is not None:
-                token_counts[uid] = int(cnt)
+        try:
+            async with db.begin_nested():
+                tok_stmt = (
+                    select(DeviceToken.user_id, func.count(DeviceToken.id))
+                    .where(DeviceToken.is_active == True, DeviceToken.user_id.in_(user_ids))
+                    .group_by(DeviceToken.user_id)
+                )
+                for uid, cnt in (await db.execute(tok_stmt)).all():
+                    if uid is not None:
+                        token_counts[uid] = int(cnt)
+        except Exception:
+            # Continua listando os usuários normalmente mesmo sem registros/tabela de token FCM
+            token_counts = {}
     
     return [
         {
@@ -96,8 +103,8 @@ async def list_admin_users(
             "fcm_token_count": token_counts.get(u.id, 0),
             "total_received": u.total_contacts_received,
             "total_shared": u.total_contacts_shared,
-            "reciprocity_score": u.reciprocity_score,
-            "created_at": u.created_at.isoformat()
+            "reciprocity_score": float(u.reciprocity_score if u.reciprocity_score is not None else 1.0),
+            "created_at": u.created_at.isoformat() if u.created_at else ""
         }
         for u in users
     ]
@@ -145,6 +152,7 @@ async def toggle_user_active(user_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.get("/push/summary", dependencies=[Depends(verify_admin_push_secret)])
 async def get_push_summary(db: AsyncSession = Depends(get_db)):
+    await ensure_push_tables()
     counts = await get_audience_counts(db)
     firebase_ok, firebase_err = ensure_firebase_initialized()
     return {
@@ -158,6 +166,7 @@ async def get_push_history(
     limit: int = 30,
     db: AsyncSession = Depends(get_db)
 ):
+    await ensure_push_tables()
     stmt = select(PushCampaign).order_by(desc(PushCampaign.created_at)).limit(limit)
     rows = (await db.execute(stmt)).scalars().all()
     return [
@@ -172,7 +181,7 @@ async def get_push_history(
             "firebase_accepted": row.firebase_accepted,
             "firebase_errors": row.firebase_errors,
             "error_summary": row.error_summary or "",
-            "created_at": row.created_at.isoformat()
+            "created_at": row.created_at.isoformat() if row.created_at else ""
         }
         for row in rows
     ]
@@ -182,6 +191,7 @@ async def send_test_push(
     payload: PushSendRequest,
     db: AsyncSession = Depends(get_db)
 ):
+    await ensure_push_tables()
     if not payload.target_user_id:
         raise HTTPException(status_code=400, detail="Selecione um usuário para enviar a notificação de teste.")
     try:
@@ -201,6 +211,7 @@ async def send_bulk_push(
     payload: PushSendRequest,
     db: AsyncSession = Depends(get_db)
 ):
+    await ensure_push_tables()
     audience = payload.audience if payload.audience in {"all", "free", "premium"} else "all"
     try:
         result = await send_push_campaign(
@@ -844,7 +855,13 @@ async def admin_dashboard():
             const tbody = document.getElementById('userTableBody');
             try {
                 const res = await fetch(`/admin/users?search=${encodeURIComponent(search)}`);
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
+                }
                 const users = await res.json();
+                if (!Array.isArray(users)) {
+                    throw new Error('Resposta inválida ao listar usuários');
+                }
                 if (!search) {
                     populateTestUserSelect(users);
                 }
@@ -852,16 +869,22 @@ async def admin_dashboard():
                     tbody.innerHTML = '<tr><td colspan="7" class="text-center py-6 text-slate-500">Nenhum participante encontrado.</td></tr>';
                     return;
                 }
-                tbody.innerHTML = users.map(u => `
+                tbody.innerHTML = users.map(u => {
+                    const userName = u.name || 'Participante';
+                    const score = Number(u.reciprocity_score ?? 1.0).toFixed(2);
+                    const tokenBadge = u.has_fcm_token
+                        ? '<span class="text-[10px] px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-300 border border-sky-500/30">📱 Push</span>'
+                        : '<span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-700/80 text-slate-400 border border-slate-600/60">Sem token</span>';
+                    return `
                     <tr class="hover:bg-slate-700/30 transition ${u.is_premium ? 'bg-amber-500/5' : ''}">
                         <td class="py-3 px-4 font-medium text-white flex items-center gap-2">
                             <span class="w-7 h-7 rounded-full ${u.is_premium ? 'bg-amber-500/20 text-amber-300 border-amber-500' : 'bg-emerald-950 text-emerald-400 border-emerald-700'} border flex items-center justify-center text-xs font-bold">
-                                ${u.is_premium ? '★' : escapeHtml(u.name.charAt(0).toUpperCase())}
+                                ${u.is_premium ? '★' : escapeHtml(userName.charAt(0).toUpperCase())}
                             </span>
                             <div>
                                 <div class="flex items-center gap-1.5">
-                                    <span>${escapeHtml(u.name)}</span>
-                                    ${u.has_fcm_token ? '<span class="text-[10px] px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-300 border border-sky-500/30">📱 Push</span>' : ''}
+                                    <span>${escapeHtml(userName)}</span>
+                                    ${tokenBadge}
                                 </div>
                                 <div class="text-xs text-slate-400 truncate max-w-[160px]">${escapeHtml(u.bio || 'Status do WhatsApp')}</div>
                             </div>
@@ -874,8 +897,8 @@ async def admin_dashboard():
                                 : '<span class="text-xs px-2.5 py-0.5 rounded-full bg-slate-700 text-slate-300">Grátis</span>'}
                         </td>
                         <td class="py-3 px-4">
-                            <span class="px-2 py-0.5 rounded text-xs font-semibold ${u.reciprocity_score >= 1.0 ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30' : 'bg-amber-500/10 text-amber-400 border border-amber-500/30'}">
-                                ${u.reciprocity_score.toFixed(2)}
+                            <span class="px-2 py-0.5 rounded text-xs font-semibold ${Number(score) >= 1.0 ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30' : 'bg-amber-500/10 text-amber-400 border border-amber-500/30'}">
+                                ${score}
                             </span>
                         </td>
                         <td class="py-3 px-4">
@@ -895,7 +918,8 @@ async def admin_dashboard():
                             </button>
                         </td>
                     </tr>
-                `).join('');
+                `;
+                }).join('');
             } catch(e) {
                 tbody.innerHTML = '<tr><td colspan="7" class="text-center py-6 text-rose-400">Erro ao buscar dados.</td></tr>';
             }

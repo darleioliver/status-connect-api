@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 from sqlalchemy import desc, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from db_migrations import ensure_push_tables
 from models import AuditLog, DeviceToken, PushCampaign, User
 
 _firebase_init_error: Optional[str] = None
@@ -64,6 +65,7 @@ async def register_device_token(
     user_id: Optional[int] = None,
     device_platform: str = "android"
 ) -> DeviceToken:
+    await ensure_push_tables()
     clean_token = fcm_token.strip()
     now = datetime.datetime.utcnow()
 
@@ -105,6 +107,7 @@ async def get_tokens_for_audience(
     audience: str,
     target_user_id: Optional[int] = None
 ) -> Tuple[List[DeviceToken], str]:
+    await ensure_push_tables()
     now_label = ""
     if audience == "test":
         if not target_user_id:
@@ -209,6 +212,7 @@ async def send_push_campaign(
     audience: str = "all",
     target_user_id: Optional[int] = None,
 ) -> Dict:
+    await ensure_push_tables()
     clean_title = title.strip()
     clean_body = body.strip()
     norm_audience = audience if audience in {"all", "free", "premium", "test"} else "all"

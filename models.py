@@ -42,6 +42,11 @@ class User(Base):
         back_populates="shared_contact_user",
         cascade="all, delete-orphan"
     )
+    device_tokens = relationship(
+        "DeviceToken",
+        back_populates="user",
+        passive_deletes=True
+    )
 
 class ContactExchange(Base):
     __tablename__ = "contact_exchanges"
@@ -105,18 +110,28 @@ class DeviceToken(Base):
     last_seen_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
 
+    __table_args__ = (
+        Index("idx_device_tokens_user_active", "user_id", "is_active"),
+        Index("idx_device_tokens_active_last_seen", "is_active", "last_seen_at"),
+    )
+
+    user = relationship("User", back_populates="device_tokens")
+
 class PushCampaign(Base):
     __tablename__ = "push_campaigns"
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     title = Column(String(150), nullable=False)
     body = Column(Text, nullable=False)
-    audience = Column(String(20), default="all", nullable=False) # all, free, premium, test
-    target_user_id = Column(Integer, nullable=True)
+    audience = Column(String(20), default="all", nullable=False, index=True) # all, free, premium, test
+    target_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     target_user_label = Column(String(160), default="", nullable=True)
     total_targeted = Column(Integer, default=0, nullable=False)
     firebase_accepted = Column(Integer, default=0, nullable=False)
     firebase_errors = Column(Integer, default=0, nullable=False)
     error_summary = Column(Text, default="", nullable=True)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
+
+    target_user = relationship("User", foreign_keys=[target_user_id], passive_deletes=True)
+
 

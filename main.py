@@ -7,7 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, func, and_, update, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import engine, Base, get_db
+from database import engine, get_db
+from db_migrations import ensure_push_tables, ensure_push_tables_and_schema
 from models import User, ContactExchange, OtpVerification, Report, AuditLog, DeviceToken, PushCampaign
 from schemas import (
     OtpRequest, OtpVerifyRequest, LoginRequest, UserRegisterRequest, UserResponse,
@@ -23,19 +24,8 @@ from admin import router as admin_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Inicializa as tabelas do banco no startup e garante colunas novas sem apagar dados
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        for sql_stmt in [
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_premium BOOLEAN NOT NULL DEFAULT FALSE",
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_date VARCHAR(16) DEFAULT ''",
-            "ALTER TABLE users ADD COLUMN is_premium BOOLEAN NOT NULL DEFAULT 0",
-            "ALTER TABLE users ADD COLUMN last_active_date VARCHAR(16) DEFAULT ''"
-        ]:
-            try:
-                await conn.execute(text(sql_stmt))
-            except Exception:
-                pass
+    # Inicializa todas as tabelas e migrações idempotentes em transações isoladas sem apagar dados
+    await ensure_push_tables_and_schema(force=True)
     
     from database import AsyncSessionLocal
     async with AsyncSessionLocal() as session:
@@ -135,6 +125,7 @@ async def register_fcm_token_endpoint(
     payload: DeviceTokenRegisterRequest,
     db: AsyncSession = Depends(get_db)
 ):
+    await ensure_push_tables()
     await register_device_token(
         db=db,
         fcm_token=payload.fcm_token,
