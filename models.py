@@ -93,3 +93,30 @@ class AuditLog(Base):
     ip_address = Column(String(50), nullable=True)
     timestamp = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     details = Column(String(500), default="", nullable=True)
+
+class DeviceToken(Base):
+    __tablename__ = "device_tokens"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    fcm_token = Column(String(512), unique=True, index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    device_platform = Column(String(20), default="android", nullable=False)
+    is_active = Column(Boolean, default=True, index=True, nullable=False)
+    last_seen_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+
+class PushCampaign(Base):
+    __tablename__ = "push_campaigns"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    title = Column(String(150), nullable=False)
+    body = Column(Text, nullable=False)
+    audience = Column(String(20), default="all", nullable=False) # all, free, premium, test
+    target_user_id = Column(Integer, nullable=True)
+    target_user_label = Column(String(160), default="", nullable=True)
+    total_targeted = Column(Integer, default=0, nullable=False)
+    firebase_accepted = Column(Integer, default=0, nullable=False)
+    firebase_errors = Column(Integer, default=0, nullable=False)
+    error_summary = Column(Text, default="", nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+

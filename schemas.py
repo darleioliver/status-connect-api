@@ -130,3 +130,15 @@ class AdminUserDto(BaseModel):
     total_shared: int
     reciprocity_score: float
     created_at: datetime.datetime
+
+class DeviceTokenRegisterRequest(BaseModel):
+    fcm_token: str = Field(..., min_length=20, max_length=512)
+    user_id: Optional[int] = None
+    device_platform: str = Field(default="android", max_length=20)
+
+class PushSendRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=120)
+    body: str = Field(..., min_length=1, max_length=500)
+    audience: str = Field(default="all") # all, free, premium, test
+    target_user_id: Optional[int] = None
+

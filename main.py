@@ -8,16 +8,17 @@ from sqlalchemy import select, func, and_, update, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import engine, Base, get_db
-from models import User, ContactExchange, OtpVerification, Report, AuditLog
+from models import User, ContactExchange, OtpVerification, Report, AuditLog, DeviceToken, PushCampaign
 from schemas import (
     OtpRequest, OtpVerifyRequest, LoginRequest, UserRegisterRequest, UserResponse,
     ContactDto, ExchangeRequest, ExchangeBatchResponse, StatsResponse,
-    PrivacyUpdateRequest, ReportRequest, MarkBatchAddedRequest
+    PrivacyUpdateRequest, ReportRequest, MarkBatchAddedRequest, DeviceTokenRegisterRequest
 )
 from exchange_service import (
     generate_and_store_otp, verify_otp, get_reciprocal_contacts_batch,
     seed_initial_community_pool, pause_expired_free_users, brasilia_today_str
 )
+from push_service import register_device_token
 from admin import router as admin_router
 
 @asynccontextmanager
@@ -126,6 +127,24 @@ async def get_public_network_contacts(
         )
         for u in users
     ]
+
+# --- Registro de Token FCM (Firebase Cloud Messaging) ---
+
+@app.post("/api/v1/devices/fcm-token", tags=["Notificações Push"])
+async def register_fcm_token_endpoint(
+    payload: DeviceTokenRegisterRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    await register_device_token(
+        db=db,
+        fcm_token=payload.fcm_token,
+        user_id=payload.user_id,
+        device_platform=payload.device_platform
+    )
+    return {
+        "success": True,
+        "message": "Token FCM sincronizado com sucesso."
+    }
 
 # --- OTP & Verificação Segura ---
 
