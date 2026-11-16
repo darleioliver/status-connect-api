@@ -1,10 +1,20 @@
+import base64
 import datetime
+import hashlib
 import hmac
+import json
 import os
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from fastapi.responses import HTMLResponse
+import secrets
+import time
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import select, func, desc, update
 from sqlalchemy.ext.asyncio import AsyncSession
+
 from database import get_db
 from db_migrations import ensure_push_tables
 from models import User, ContactExchange, Report, AuditLog, DeviceToken, PushCampaign
@@ -14,22 +24,417 @@ from push_service import ensure_firebase_initialized, get_audience_counts, send_
 
 router = APIRouter(prefix="/admin", tags=["Administração"])
 
+ADMIN_SESSION_COOKIE = "statuszap_admin_session"
+ADMIN_SESSION_TTL_SECONDS = max(300, int(os.getenv("ADMIN_SESSION_TTL_SECONDS", str(8 * 3600))))
+_LOGIN_RATE_WINDOW_SECONDS = 300
+_LOGIN_MAX_ATTEMPTS = 10
 
-def verify_admin_push_secret(x_admin_secret: str = Header(default="")):
+_revoked_jtis: Dict[str, int] = {}
+_failed_login_attempts: Dict[str, List[float]] = {}
+
+_NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+class AdminLoginRequest(BaseModel):
+    password: str = Field(..., min_length=1, max_length=256)
+
+
+def _get_configured_admin_secret() -> str:
     expected = os.getenv("ADMIN_PUSH_SECRET", "").strip()
     if not expected:
         raise HTTPException(
             status_code=503,
             detail="Variável ADMIN_PUSH_SECRET não configurada no Railway. Defina uma senha de administrador nas variáveis do servidor."
         )
-    if not x_admin_secret or not hmac.compare_digest(x_admin_secret.strip(), expected):
+    return expected
+
+
+def _derive_hmac_key(purpose: str, admin_secret: str) -> bytes:
+    return hashlib.sha256(f"statuszap-admin:{purpose}:{admin_secret}".encode("utf-8")).digest()
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(value: str) -> bytes:
+    padded = value + "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def _purge_expired_revocations(now_ts: int) -> None:
+    expired = [jti for jti, exp in _revoked_jtis.items() if exp <= now_ts]
+    for jti in expired:
+        _revoked_jtis.pop(jti, None)
+
+
+def _compute_csrf_token(admin_secret: str, jti: str, exp_ts: int) -> str:
+    digest = hmac.new(
+        _derive_hmac_key("csrf", admin_secret),
+        f"{jti}:{exp_ts}".encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    return _b64url_encode(digest)
+
+
+def _create_session_token(admin_secret: str) -> Tuple[str, str, int]:
+    now_ts = int(time.time())
+    exp_ts = now_ts + ADMIN_SESSION_TTL_SECONDS
+    jti = secrets.token_urlsafe(18)
+    payload = {
+        "sub": "statuszap_admin",
+        "jti": jti,
+        "iat": now_ts,
+        "exp": exp_ts,
+    }
+    payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+    sig = hmac.new(
+        _derive_hmac_key("session", admin_secret),
+        payload_b64.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    token = f"{payload_b64}.{_b64url_encode(sig)}"
+    csrf_token = _compute_csrf_token(admin_secret, jti, exp_ts)
+    return token, csrf_token, exp_ts
+
+
+def _verify_session_token(token: str, admin_secret: str) -> Optional[Dict]:
+    if not token or "." not in token:
+        return None
+    parts = token.split(".")
+    if len(parts) != 2:
+        return None
+    payload_b64, sig_b64 = parts
+    try:
+        expected_sig = hmac.new(
+            _derive_hmac_key("session", admin_secret),
+            payload_b64.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+        provided_sig = _b64url_decode(sig_b64)
+        if not hmac.compare_digest(expected_sig, provided_sig):
+            return None
+        payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict) or payload.get("sub") != "statuszap_admin":
+        return None
+    jti = payload.get("jti")
+    exp = payload.get("exp")
+    iat = payload.get("iat")
+    if not isinstance(jti, str) or not jti or not isinstance(exp, int) or not isinstance(iat, int):
+        return None
+
+    now_ts = int(time.time())
+    _purge_expired_revocations(now_ts)
+    if jti in _revoked_jtis:
+        return None
+    if now_ts >= exp or iat > now_ts + 60:
+        return None
+    return payload
+
+
+def _should_use_secure_cookie(request: Request) -> bool:
+    env_override = os.getenv("ADMIN_COOKIE_SECURE", "").strip().lower()
+    if env_override in {"false", "0", "no"}:
+        return False
+    if env_override in {"true", "1", "yes"}:
+        return True
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    if forwarded_proto == "https" or request.url.scheme == "https":
+        return True
+    host = (request.headers.get("host", "") or request.url.hostname or "").split(":")[0].lower()
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return False
+    return True
+
+
+def _verify_same_origin(request: Request) -> None:
+    origin = request.headers.get("origin", "").strip()
+    if not origin:
+        return
+    expected_host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or "").split(",")[0].strip().lower()
+    origin_host = urlparse(origin).netloc.strip().lower()
+    if not expected_host or not origin_host or not hmac.compare_digest(origin_host, expected_host):
         raise HTTPException(
-            status_code=401,
-            detail="Senha de administrador inválida."
+            status_code=403,
+            detail="Origem não autorizada para acesso administrativo."
         )
 
 
-@router.get("/metrics")
+def _get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    if forwarded:
+        return forwarded
+    return request.client.host if request.client else "unknown"
+
+
+def _get_valid_session_optional(request: Request) -> Optional[Tuple[Dict, str]]:
+    try:
+        admin_secret = _get_configured_admin_secret()
+    except HTTPException:
+        return None
+    token = request.cookies.get(ADMIN_SESSION_COOKIE, "")
+    session = _verify_session_token(token, admin_secret)
+    if not session:
+        return None
+    return session, admin_secret
+
+
+async def require_admin_read(request: Request) -> Dict:
+    _verify_same_origin(request)
+    admin_secret = _get_configured_admin_secret()
+    token = request.cookies.get(ADMIN_SESSION_COOKIE, "")
+    session = _verify_session_token(token, admin_secret)
+    if not session:
+        raise HTTPException(
+            status_code=401,
+            detail="Sessão administrativa ausente ou expirada. Faça login em /admin/login."
+        )
+    return session
+
+
+async def require_admin_write(
+    request: Request,
+    x_csrf_token: str = Header(default="", alias="X-CSRF-Token"),
+) -> Dict:
+    _verify_same_origin(request)
+    admin_secret = _get_configured_admin_secret()
+    token = request.cookies.get(ADMIN_SESSION_COOKIE, "")
+    session = _verify_session_token(token, admin_secret)
+    if not session:
+        raise HTTPException(
+            status_code=401,
+            detail="Sessão administrativa ausente ou expirada. Faça login novamente."
+        )
+    expected_csrf = _compute_csrf_token(admin_secret, session["jti"], int(session["exp"]))
+    if not x_csrf_token or not hmac.compare_digest(x_csrf_token.strip(), expected_csrf):
+        raise HTTPException(
+            status_code=403,
+            detail="Token CSRF inválido ou ausente. Recarregue o painel administrativo."
+        )
+    return session
+
+
+def _render_login_html(secret_configured: bool = True) -> str:
+    missing_banner = ""
+    if not secret_configured:
+        missing_banner = (
+            '<div class="mb-4 rounded-xl border border-amber-500/40 bg-amber-950/60 p-3.5 text-xs text-amber-200">'
+            '<strong>Atenção:</strong> A variável <code>ADMIN_PUSH_SECRET</code> ainda não está configurada no Railway. '
+            'Defina-a nas variáveis de ambiente do servidor antes de entrar.'
+            '</div>'
+        )
+    html = """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login Administrativo — StatusZap</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>body { font-family: 'Inter', sans-serif; }</style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex items-center justify-center p-4">
+    <div class="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl p-7 shadow-2xl space-y-6">
+        <div class="flex items-center gap-3">
+            <div class="w-11 h-11 rounded-xl bg-emerald-500 flex items-center justify-center font-bold text-slate-950 text-xl shadow-lg shadow-emerald-500/20">
+                SZ
+            </div>
+            <div>
+                <h1 class="text-lg font-bold text-white">Painel Administrativo — StatusZap</h1>
+                <p class="text-xs text-emerald-400">Acesso restrito com sessão segura e proteção CSRF</p>
+            </div>
+        </div>
+
+        __MISSING_BANNER__
+
+        <form id="adminLoginForm" onsubmit="submitAdminLogin(event)" class="space-y-4">
+            <div>
+                <label for="adminPassword" class="block text-xs font-semibold uppercase tracking-wider text-slate-300 mb-1.5">
+                    Senha Administrativa
+                </label>
+                <input id="adminPassword" type="password" required autocomplete="current-password"
+                       placeholder="Digite a senha configurada no servidor"
+                       class="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500">
+            </div>
+
+            <div id="loginErrorBox" class="hidden rounded-xl border border-rose-500/40 bg-rose-950/60 px-3.5 py-2.5 text-xs text-rose-200"></div>
+
+            <button id="loginSubmitBtn" type="submit"
+                    class="w-full py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm shadow-lg shadow-emerald-500/20 transition">
+                Entrar no Painel
+            </button>
+        </form>
+
+        <p class="text-[11px] text-slate-500 text-center">
+            Autenticação validada com cookie HttpOnly, Secure e SameSite.
+        </p>
+    </div>
+
+    <script>
+        async function submitAdminLogin(event) {
+            event.preventDefault();
+            const pwdInput = document.getElementById('adminPassword');
+            const errBox = document.getElementById('loginErrorBox');
+            const btn = document.getElementById('loginSubmitBtn');
+            const password = (pwdInput.value || '').trim();
+
+            errBox.classList.add('hidden');
+            if (!password) {
+                errBox.textContent = 'Informe a senha administrativa.';
+                errBox.classList.remove('hidden');
+                return;
+            }
+
+            btn.disabled = true;
+            btn.textContent = 'Verificando...';
+
+            try {
+                const res = await fetch('/admin/login', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password })
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    errBox.textContent = data.detail || 'Senha inválida.';
+                    errBox.classList.remove('hidden');
+                    return;
+                }
+                window.location.href = data.redirect || '/admin/dashboard';
+            } catch (e) {
+                errBox.textContent = 'Erro de conexão com o servidor.';
+                errBox.classList.remove('hidden');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Entrar no Painel';
+            }
+        }
+    </script>
+</body>
+</html>"""
+    return html.replace("__MISSING_BANNER__", missing_banner)
+
+
+@router.get("/login", response_class=HTMLResponse)
+async def admin_login_page(request: Request):
+    if _get_valid_session_optional(request) is not None:
+        return RedirectResponse(url="/admin/dashboard", status_code=303, headers=_NO_CACHE_HEADERS)
+    secret_configured = bool(os.getenv("ADMIN_PUSH_SECRET", "").strip())
+    return HTMLResponse(content=_render_login_html(secret_configured), headers=_NO_CACHE_HEADERS)
+
+
+@router.post("/login")
+async def admin_login_submit(
+    payload: AdminLoginRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    _verify_same_origin(request)
+    admin_secret = _get_configured_admin_secret()
+    client_ip = _get_client_ip(request)
+    now_monotonic = time.time()
+
+    attempts = [
+        ts for ts in _failed_login_attempts.get(client_ip, [])
+        if now_monotonic - ts < _LOGIN_RATE_WINDOW_SECONDS
+    ]
+    if len(attempts) >= _LOGIN_MAX_ATTEMPTS:
+        _failed_login_attempts[client_ip] = attempts
+        raise HTTPException(
+            status_code=429,
+            detail="Muitas tentativas de login. Aguarde alguns minutos antes de tentar novamente."
+        )
+
+    if not hmac.compare_digest(payload.password.strip(), admin_secret):
+        attempts.append(now_monotonic)
+        _failed_login_attempts[client_ip] = attempts
+        raise HTTPException(
+            status_code=401,
+            detail="Senha administrativa incorreta."
+        )
+
+    _failed_login_attempts.pop(client_ip, None)
+    token, _csrf_token, _exp_ts = _create_session_token(admin_secret)
+
+    try:
+        db.add(
+            AuditLog(
+                user_id=None,
+                action="ADMIN_LOGIN_SUCCESS",
+                ip_address=client_ip[:50],
+                timestamp=datetime.datetime.utcnow(),
+                details="Sessão administrativa autenticada com sucesso.",
+            )
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+
+    response = JSONResponse(
+        content={"success": True, "redirect": "/admin/dashboard"},
+        headers=_NO_CACHE_HEADERS,
+    )
+    response.set_cookie(
+        key=ADMIN_SESSION_COOKIE,
+        value=token,
+        max_age=ADMIN_SESSION_TTL_SECONDS,
+        expires=ADMIN_SESSION_TTL_SECONDS,
+        path="/admin",
+        httponly=True,
+        secure=_should_use_secure_cookie(request),
+        samesite="lax",
+    )
+    return response
+
+
+@router.post("/logout")
+async def admin_logout(
+    request: Request,
+    session: Dict = Depends(require_admin_write),
+    db: AsyncSession = Depends(get_db),
+):
+    _revoked_jtis[session["jti"]] = int(session["exp"])
+    client_ip = _get_client_ip(request)
+    try:
+        db.add(
+            AuditLog(
+                user_id=None,
+                action="ADMIN_LOGOUT",
+                ip_address=client_ip[:50],
+                timestamp=datetime.datetime.utcnow(),
+                details="Administrador encerrou a sessão do painel.",
+            )
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+
+    response = JSONResponse(
+        content={"success": True, "redirect": "/admin/login"},
+        headers=_NO_CACHE_HEADERS,
+    )
+    response.delete_cookie(
+        key=ADMIN_SESSION_COOKIE,
+        path="/admin",
+        httponly=True,
+        secure=_should_use_secure_cookie(request),
+        samesite="lax",
+    )
+    return response
+
+
+@router.get("/metrics", dependencies=[Depends(require_admin_read)])
 async def get_admin_metrics(db: AsyncSession = Depends(get_db)):
     await pause_expired_free_users(db)
     total_users = (await db.execute(select(func.count(User.id)))).scalar() or 0
@@ -54,7 +459,7 @@ async def get_admin_metrics(db: AsyncSession = Depends(get_db)):
         "avg_reciprocity": round(float(avg_reciprocity), 2)
     }
 
-@router.get("/users")
+@router.get("/users", dependencies=[Depends(require_admin_read)])
 async def list_admin_users(
     search: str = Query(default=""),
     limit: int = 100,
@@ -109,7 +514,7 @@ async def list_admin_users(
         for u in users
     ]
 
-@router.post("/users/{user_id}/toggle-premium")
+@router.post("/users/{user_id}/toggle-premium", dependencies=[Depends(require_admin_write)])
 async def toggle_user_premium(user_id: int, db: AsyncSession = Depends(get_db)):
     user = await db.get(User, user_id)
     if not user:
@@ -130,7 +535,7 @@ async def toggle_user_premium(user_id: int, db: AsyncSession = Depends(get_db)):
         "message": f"Usuário agora é {'★ Premium' if user.is_premium else 'Grátis'}!"
     }
 
-@router.post("/users/{user_id}/toggle-pause")
+@router.post("/users/{user_id}/toggle-pause", dependencies=[Depends(require_admin_write)])
 async def toggle_user_pause(user_id: int, db: AsyncSession = Depends(get_db)):
     user = await db.get(User, user_id)
     if not user:
@@ -139,7 +544,7 @@ async def toggle_user_pause(user_id: int, db: AsyncSession = Depends(get_db)):
     await db.commit()
     return {"message": f"Usuário {'pausado' if user.is_paused else 'reativado'} com sucesso."}
 
-@router.post("/users/{user_id}/toggle-active")
+@router.post("/users/{user_id}/toggle-active", dependencies=[Depends(require_admin_write)])
 async def toggle_user_active(user_id: int, db: AsyncSession = Depends(get_db)):
     user = await db.get(User, user_id)
     if not user:
@@ -148,9 +553,9 @@ async def toggle_user_active(user_id: int, db: AsyncSession = Depends(get_db)):
     await db.commit()
     return {"message": f"Status do usuário alterado para {'ativo' if user.is_active else 'bloqueado'}."}
 
-# --- Notificações Push (Protegido por ADMIN_PUSH_SECRET) ---
+# --- Notificações Push (Protegido por Sessão Admin + CSRF) ---
 
-@router.get("/push/summary", dependencies=[Depends(verify_admin_push_secret)])
+@router.get("/push/summary", dependencies=[Depends(require_admin_read)])
 async def get_push_summary(db: AsyncSession = Depends(get_db)):
     await ensure_push_tables()
     counts = await get_audience_counts(db)
@@ -161,7 +566,7 @@ async def get_push_summary(db: AsyncSession = Depends(get_db)):
         "firebase_error": firebase_err or ""
     }
 
-@router.get("/push/history", dependencies=[Depends(verify_admin_push_secret)])
+@router.get("/push/history", dependencies=[Depends(require_admin_read)])
 async def get_push_history(
     limit: int = 30,
     db: AsyncSession = Depends(get_db)
@@ -186,7 +591,7 @@ async def get_push_history(
         for row in rows
     ]
 
-@router.post("/push/test", dependencies=[Depends(verify_admin_push_secret)])
+@router.post("/push/test", dependencies=[Depends(require_admin_write)])
 async def send_test_push(
     payload: PushSendRequest,
     db: AsyncSession = Depends(get_db)
@@ -206,7 +611,7 @@ async def send_test_push(
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
-@router.post("/push/send", dependencies=[Depends(verify_admin_push_secret)])
+@router.post("/push/send", dependencies=[Depends(require_admin_write)])
 async def send_bulk_push(
     payload: PushSendRequest,
     db: AsyncSession = Depends(get_db)
@@ -225,7 +630,7 @@ async def send_bulk_push(
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
-@router.get("/reports")
+@router.get("/reports", dependencies=[Depends(require_admin_read)])
 async def list_reports(db: AsyncSession = Depends(get_db)):
     res = await db.execute(select(Report).order_by(desc(Report.created_at)).limit(50))
     reports = res.scalars().all()
@@ -242,7 +647,7 @@ async def list_reports(db: AsyncSession = Depends(get_db)):
         for r in reports
     ]
 
-@router.post("/reports/{report_id}/resolve")
+@router.post("/reports/{report_id}/resolve", dependencies=[Depends(require_admin_write)])
 async def resolve_report(report_id: int, action: str = "resolve", db: AsyncSession = Depends(get_db)):
     report = await db.get(Report, report_id)
     if not report:
@@ -256,14 +661,22 @@ async def resolve_report(report_id: int, action: str = "resolve", db: AsyncSessi
     return {"message": "Denúncia processada."}
 
 @router.get("/dashboard", response_class=HTMLResponse)
-async def admin_dashboard():
+async def admin_dashboard(request: Request):
+    auth_info = _get_valid_session_optional(request)
+    if auth_info is None:
+        return RedirectResponse(url="/admin/login", status_code=303, headers=_NO_CACHE_HEADERS)
+
+    session, admin_secret = auth_info
+    csrf_token = _compute_csrf_token(admin_secret, session["jti"], int(session["exp"]))
+
     # Painel administrativo visual completo e responsivo integrado na FastAPI
-    return """
+    html = """
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="__CSRF_TOKEN__">
     <title>Painel Administrativo — StatusZap</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -283,14 +696,17 @@ async def admin_dashboard():
                 <p class="text-xs text-emerald-400">Controle de Troca Recíproca, Notificações Push & Conformidade LGPD</p>
             </div>
         </div>
-        <div class="flex items-center gap-3">
+        <div class="flex flex-wrap items-center gap-3">
             <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
                 <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-                Servidor Conectado
+                Sessão Protegida
             </span>
             <a href="/docs" target="_blank" class="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition">
                 API Docs (Swagger)
             </a>
+            <button onclick="logoutAdmin()" class="px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-rose-600/90 hover:bg-rose-500 text-white border border-rose-500/50 transition">
+                Sair
+            </button>
         </div>
     </header>
 
@@ -331,19 +747,10 @@ async def admin_dashboard():
                     <div class="flex items-center gap-2.5">
                         <h2 class="text-lg font-semibold text-white">Notificações Push</h2>
                         <span id="fcmStatusBadge" class="text-xs px-2.5 py-0.5 rounded-full bg-slate-700 text-slate-300 border border-slate-600">
-                            Autentique para carregar status FCM
+                            Verificando status FCM...
                         </span>
                     </div>
                     <p class="text-sm text-slate-400 mt-0.5">Envie avisos pelo Firebase Cloud Messaging (FCM) com prévia, teste individual e histórico.</p>
-                </div>
-
-                <!-- Chave/Senha Admin para Disparo -->
-                <div class="flex flex-wrap items-center gap-2">
-                    <input id="adminSecretInput" type="password" placeholder="Senha Admin (ADMIN_PUSH_SECRET)"
-                           class="bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500 w-64">
-                    <button onclick="unlockPushSection()" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-sm rounded-xl transition">
-                        Desbloquear Push
-                    </button>
                 </div>
             </div>
 
@@ -482,7 +889,7 @@ async def admin_dashboard():
                         </thead>
                         <tbody id="pushHistoryBody" class="divide-y divide-slate-700/60">
                             <tr>
-                                <td colspan="7" class="text-center py-5 text-slate-500">Informe a senha admin acima e clique em "Desbloquear Push" para ver o histórico.</td>
+                                <td colspan="7" class="text-center py-5 text-slate-500">Carregando histórico de envios...</td>
                             </tr>
                         </tbody>
                     </table>
@@ -559,15 +966,35 @@ async def admin_dashboard():
             return div.innerHTML;
         }
 
-        function getAdminSecret() {
-            const inputVal = (document.getElementById('adminSecretInput').value || '').trim();
-            if (inputVal) return inputVal;
-            return (sessionStorage.getItem('statuszap_admin_push_secret') || '').trim();
+        function getCsrfToken() {
+            const meta = document.querySelector('meta[name="csrf-token"]');
+            return meta ? (meta.getAttribute('content') || '') : '';
         }
 
-        function saveAdminSecret(secret) {
-            if (secret) {
-                sessionStorage.setItem('statuszap_admin_push_secret', secret);
+        async function adminFetch(url, options = {}) {
+            const method = (options.method || 'GET').toUpperCase();
+            const headers = Object.assign({}, options.headers || {});
+            if (method !== 'GET' && method !== 'HEAD') {
+                headers['X-CSRF-Token'] = getCsrfToken();
+            }
+            const res = await fetch(url, Object.assign({}, options, {
+                credentials: 'same-origin',
+                headers
+            }));
+            if (res.status === 401) {
+                window.location.href = '/admin/login';
+                throw new Error('Sessão administrativa expirada');
+            }
+            return res;
+        }
+
+        async function logoutAdmin() {
+            try {
+                const res = await adminFetch('/admin/logout', { method: 'POST' });
+                const data = await res.json();
+                window.location.href = (data && data.redirect) ? data.redirect : '/admin/login';
+            } catch (e) {
+                window.location.href = '/admin/login';
             }
         }
 
@@ -598,28 +1025,13 @@ async def admin_dashboard():
             return 'Todos os usuários';
         }
 
-        async function unlockPushSection() {
-            const secret = getAdminSecret();
-            if (!secret) {
-                showPushResult(false, '<strong>Informe a senha de administrador</strong> (variável ADMIN_PUSH_SECRET no Railway).');
-                return;
-            }
-            saveAdminSecret(secret);
-            await loadPushSummary();
-            await loadPushHistory();
-        }
-
         async function loadPushSummary() {
-            const secret = getAdminSecret();
             const badge = document.getElementById('fcmStatusBadge');
-            if (!secret) return;
             try {
-                const res = await fetch('/admin/push/summary', {
-                    headers: { 'X-Admin-Secret': secret }
-                });
+                const res = await adminFetch('/admin/push/summary');
                 const data = await res.json();
                 if (!res.ok) {
-                    badge.textContent = data.detail || 'Senha admin inválida';
+                    badge.textContent = data.detail || 'Erro ao verificar FCM';
                     badge.className = 'text-xs px-2.5 py-0.5 rounded-full bg-rose-500/20 text-rose-300 border border-rose-500/40';
                     return;
                 }
@@ -641,13 +1053,9 @@ async def admin_dashboard():
         }
 
         async function loadPushHistory() {
-            const secret = getAdminSecret();
             const tbody = document.getElementById('pushHistoryBody');
-            if (!secret) return;
             try {
-                const res = await fetch('/admin/push/history', {
-                    headers: { 'X-Admin-Secret': secret }
-                });
+                const res = await adminFetch('/admin/push/history');
                 if (!res.ok) {
                     const err = await res.json();
                     tbody.innerHTML = `<tr><td colspan="7" class="text-center py-5 text-rose-400">${escapeHtml(err.detail || 'Não autorizado')}</td></tr>`;
@@ -659,7 +1067,7 @@ async def admin_dashboard():
                     return;
                 }
                 tbody.innerHTML = rows.map(r => {
-                    const dt = new Date(r.created_at + 'Z').toLocaleString('pt-BR');
+                    const dt = r.created_at ? new Date(r.created_at + 'Z').toLocaleString('pt-BR') : '--';
                     const audTag = r.audience === 'premium'
                         ? '<span class="px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300">Premium</span>'
                         : r.audience === 'free'
@@ -708,15 +1116,10 @@ async def admin_dashboard():
         }
 
         async function sendTestPush() {
-            const secret = getAdminSecret();
             const title = document.getElementById('pushTitleInput').value.trim();
             const body = document.getElementById('pushBodyInput').value.trim();
             const targetUserId = Number(document.getElementById('testUserSelect').value || 0);
 
-            if (!secret) {
-                showPushResult(false, 'Informe a senha de administrador e clique em Desbloquear Push antes de testar.');
-                return;
-            }
             if (!title || !body) {
                 showPushResult(false, 'Preencha o título e a mensagem da notificação antes de enviar o teste.');
                 return;
@@ -725,15 +1128,11 @@ async def admin_dashboard():
                 showPushResult(false, 'Selecione o usuário/número do seu celular na lista de teste.');
                 return;
             }
-            saveAdminSecret(secret);
 
             try {
-                const res = await fetch('/admin/push/test', {
+                const res = await adminFetch('/admin/push/test', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'X-Admin-Secret': secret
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         title,
                         body,
@@ -755,13 +1154,8 @@ async def admin_dashboard():
         }
 
         function openBulkPushConfirm() {
-            const secret = getAdminSecret();
             const title = document.getElementById('pushTitleInput').value.trim();
             const body = document.getElementById('pushBodyInput').value.trim();
-            if (!secret) {
-                showPushResult(false, 'Informe a senha de administrador e clique em Desbloquear Push antes de enviar.');
-                return;
-            }
             if (!title || !body) {
                 showPushResult(false, 'Preencha o título e a mensagem antes de enviar.');
                 return;
@@ -784,22 +1178,17 @@ async def admin_dashboard():
         }
 
         async function confirmBulkPushSend() {
-            const secret = getAdminSecret();
             const title = document.getElementById('pushTitleInput').value.trim();
             const body = document.getElementById('pushBodyInput').value.trim();
             const aud = document.querySelector('input[name="pushAudience"]:checked').value;
             const btn = document.getElementById('confirmSendBtn');
             btn.disabled = true;
             btn.textContent = 'Enviando...';
-            saveAdminSecret(secret);
 
             try {
-                const res = await fetch('/admin/push/send', {
+                const res = await adminFetch('/admin/push/send', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'X-Admin-Secret': secret
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ title, body, audience: aud })
                 });
                 const data = await res.json();
@@ -822,7 +1211,7 @@ async def admin_dashboard():
 
         async function loadMetrics() {
             try {
-                const res = await fetch('/admin/metrics');
+                const res = await adminFetch('/admin/metrics');
                 const data = await res.json();
                 document.getElementById('totalUsers').textContent = data.total_users;
                 document.getElementById('activeUsersRatio').textContent = `${data.active_users} ativos na rede`;
@@ -854,7 +1243,7 @@ async def admin_dashboard():
             const search = document.getElementById('searchInput').value;
             const tbody = document.getElementById('userTableBody');
             try {
-                const res = await fetch(`/admin/users?search=${encodeURIComponent(search)}`);
+                const res = await adminFetch(`/admin/users?search=${encodeURIComponent(search)}`);
                 if (!res.ok) {
                     throw new Error(`HTTP ${res.status}`);
                 }
@@ -926,35 +1315,48 @@ async def admin_dashboard():
         }
 
         async function togglePremium(id) {
-            await fetch(`/admin/users/${id}/toggle-premium`, { method: 'POST' });
-            loadUsers();
-            loadMetrics();
-            loadPushSummary();
+            try {
+                const res = await adminFetch(`/admin/users/${id}/toggle-premium`, { method: 'POST' });
+                if (!res.ok) return;
+                loadUsers();
+                loadMetrics();
+                loadPushSummary();
+            } catch (e) {
+                console.error(e);
+            }
         }
 
         async function togglePause(id) {
-            await fetch(`/admin/users/${id}/toggle-pause`, { method: 'POST' });
-            loadUsers();
-            loadMetrics();
+            try {
+                const res = await adminFetch(`/admin/users/${id}/toggle-pause`, { method: 'POST' });
+                if (!res.ok) return;
+                loadUsers();
+                loadMetrics();
+            } catch (e) {
+                console.error(e);
+            }
         }
 
         async function toggleActive(id) {
-            await fetch(`/admin/users/${id}/toggle-active`, { method: 'POST' });
-            loadUsers();
-            loadMetrics();
+            try {
+                const res = await adminFetch(`/admin/users/${id}/toggle-active`, { method: 'POST' });
+                if (!res.ok) return;
+                loadUsers();
+                loadMetrics();
+            } catch (e) {
+                console.error(e);
+            }
         }
 
-        // Init
-        const savedSecret = sessionStorage.getItem('statuszap_admin_push_secret') || '';
-        if (savedSecret) {
-            document.getElementById('adminSecretInput').value = savedSecret;
-            loadPushSummary();
-            loadPushHistory();
-        }
+        // Init (painel já autenticado via cookie HttpOnly + CSRF)
         loadMetrics();
         loadUsers();
+        loadPushSummary();
+        loadPushHistory();
         setInterval(loadMetrics, 10000);
     </script>
 </body>
 </html>
     """
+    html = html.replace("__CSRF_TOKEN__", csrf_token)
+    return HTMLResponse(content=html, headers=_NO_CACHE_HEADERS)
