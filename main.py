@@ -21,6 +21,7 @@ from exchange_service import (
 )
 from push_service import register_device_token
 from admin import router as admin_router
+from legal import router as legal_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -59,6 +60,7 @@ app.add_middleware(
 )
 
 app.include_router(admin_router)
+app.include_router(legal_router)
 
 @app.get("/api/v1/health", tags=["Sistema"])
 async def health_check():
