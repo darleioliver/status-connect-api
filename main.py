@@ -17,7 +17,8 @@ from schemas import (
 )
 from exchange_service import (
     generate_and_store_otp, verify_otp, get_reciprocal_contacts_batch,
-    seed_initial_community_pool, pause_expired_free_users, brasilia_today_str
+    seed_initial_community_pool, pause_expired_free_users, brasilia_today_str,
+    is_midnight_auto_pause_enabled
 )
 from push_service import register_device_token
 from admin import router as admin_router
@@ -72,6 +73,7 @@ async def health_check():
 
 @app.get("/api/v1/network/summary", tags=["Rede"])
 async def get_network_summary(db: AsyncSession = Depends(get_db)):
+    auto_pause_enabled = await is_midnight_auto_pause_enabled(db)
     await pause_expired_free_users(db)
     active_stmt = select(func.count(User.id)).where(User.is_active == True, User.is_paused == False)
     active_count = (await db.execute(active_stmt)).scalar() or 0
@@ -83,7 +85,8 @@ async def get_network_summary(db: AsyncSession = Depends(get_db)):
     return {
         "total_active_participants": active_count,
         "total_participants": total_count,
-        "total_exchanges": total_exchanges
+        "total_exchanges": total_exchanges,
+        "auto_midnight_pause_enabled": auto_pause_enabled
     }
 
 @app.get("/api/v1/network/public-contacts", response_model=List[ContactDto], tags=["Rede"])

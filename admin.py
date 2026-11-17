@@ -19,7 +19,11 @@ from database import get_db
 from db_migrations import ensure_push_tables
 from models import User, ContactExchange, Report, AuditLog, DeviceToken, PushCampaign
 from schemas import PushSendRequest
-from exchange_service import pause_expired_free_users
+from exchange_service import (
+    pause_expired_free_users,
+    is_midnight_auto_pause_enabled,
+    set_midnight_auto_pause_enabled,
+)
 from push_service import ensure_firebase_initialized, get_audience_counts, send_push_campaign
 
 router = APIRouter(prefix="/admin", tags=["Administração"])
@@ -44,6 +48,10 @@ _NO_CACHE_HEADERS = {
 
 class AdminLoginRequest(BaseModel):
     password: str = Field(..., min_length=1, max_length=256)
+
+
+class AutoPauseToggleRequest(BaseModel):
+    enabled: Optional[bool] = None
 
 
 def _get_configured_admin_secret() -> str:
@@ -436,6 +444,7 @@ async def admin_logout(
 
 @router.get("/metrics", dependencies=[Depends(require_admin_read)])
 async def get_admin_metrics(db: AsyncSession = Depends(get_db)):
+    auto_pause_enabled = await is_midnight_auto_pause_enabled(db)
     await pause_expired_free_users(db)
     total_users = (await db.execute(select(func.count(User.id)))).scalar() or 0
     active_users = (await db.execute(select(func.count(User.id)).where(User.is_active == True, User.is_paused == False))).scalar() or 0
@@ -456,7 +465,35 @@ async def get_admin_metrics(db: AsyncSession = Depends(get_db)):
         "total_exchanges": total_exchanges,
         "today_exchanges": today_exchanges,
         "pending_reports": pending_reports,
-        "avg_reciprocity": round(float(avg_reciprocity), 2)
+        "avg_reciprocity": round(float(avg_reciprocity), 2),
+        "auto_midnight_pause_enabled": auto_pause_enabled
+    }
+
+
+@router.get("/settings/auto-pause", dependencies=[Depends(require_admin_read)])
+async def get_auto_pause_setting(db: AsyncSession = Depends(get_db)):
+    enabled = await is_midnight_auto_pause_enabled(db)
+    return {"auto_midnight_pause_enabled": enabled}
+
+
+@router.post("/settings/auto-pause/toggle", dependencies=[Depends(require_admin_write)])
+async def toggle_auto_pause_setting(
+    payload: Optional[AutoPauseToggleRequest] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    current = await is_midnight_auto_pause_enabled(db)
+    target = (not current) if (payload is None or payload.enabled is None) else bool(payload.enabled)
+    await set_midnight_auto_pause_enabled(db, target)
+    if target:
+        await pause_expired_free_users(db)
+    return {
+        "success": True,
+        "auto_midnight_pause_enabled": target,
+        "message": (
+            "Pausamento automático à meia-noite (00:00) ATIVADO. O app continua operando normalmente para o plano Grátis."
+            if target
+            else "Pausamento automático à meia-noite DESATIVADO. Os contatos não param de ser distribuídos às 00:00."
+        ),
     }
 
 @router.get("/users", dependencies=[Depends(require_admin_read)])
@@ -739,6 +776,27 @@ async def admin_dashboard(request: Request):
                 <p class="text-xs text-slate-400 mt-1">Moderação de contatos abusivos</p>
             </div>
         </div>
+
+        <!-- Controle Global: Pausamento Automático à Meia-Noite (00:00) -->
+        <section class="bg-slate-800/80 border border-slate-700/80 rounded-2xl p-5 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div class="space-y-1">
+                <div class="flex flex-wrap items-center gap-2.5">
+                    <h2 class="text-base font-semibold text-white">Pausamento Automático da Distribuição (00:00 Brasília)</h2>
+                    <span id="autoPauseStatusBadge" class="text-xs font-bold px-2.5 py-0.5 rounded-full bg-slate-700 text-slate-300 border border-slate-600">
+                        Carregando...
+                    </span>
+                </div>
+                <p id="autoPauseDescription" class="text-sm text-slate-400">
+                    Carregando configuração atual do pausamento automático para usuários do plano Grátis...
+                </p>
+            </div>
+            <div class="flex items-center gap-3 shrink-0">
+                <button id="toggleAutoPauseBtn" onclick="toggleGlobalAutoPause()" disabled
+                        class="px-5 py-2.5 rounded-xl font-semibold text-sm bg-slate-700 text-slate-300 transition whitespace-nowrap">
+                    Carregando...
+                </button>
+            </div>
+        </section>
 
         <!-- Seção de Notificações Push (Firebase FCM) -->
         <section class="bg-slate-800/80 border border-emerald-700/40 rounded-2xl p-6 shadow-sm space-y-6">
@@ -1209,6 +1267,57 @@ async def admin_dashboard(request: Request):
             }
         }
 
+        let currentAutoPauseEnabled = true;
+
+        function renderAutoPauseControl(enabled) {
+            currentAutoPauseEnabled = Boolean(enabled);
+            const badge = document.getElementById('autoPauseStatusBadge');
+            const desc = document.getElementById('autoPauseDescription');
+            const btn = document.getElementById('toggleAutoPauseBtn');
+            if (!badge || !desc || !btn) return;
+
+            btn.disabled = false;
+            if (currentAutoPauseEnabled) {
+                badge.textContent = 'ATIVADO (Pausa às 00:00)';
+                badge.className = 'text-xs font-bold px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40';
+                desc.textContent = 'Modo padrão ativo: usuários do plano Grátis pausam automaticamente à meia-noite e precisam reativar no aplicativo.';
+                btn.textContent = 'Desativar Pausamento Automático';
+                btn.className = 'px-5 py-2.5 rounded-xl font-semibold text-sm bg-amber-500 hover:bg-amber-400 text-slate-950 shadow-lg shadow-amber-500/15 transition whitespace-nowrap';
+            } else {
+                badge.textContent = 'DESATIVADO (24h Contínuo)';
+                badge.className = 'text-xs font-bold px-2.5 py-0.5 rounded-full bg-sky-500/20 text-sky-300 border border-sky-500/40';
+                desc.textContent = 'Pausamento automático desligado: os contatos continuam sendo distribuídos normalmente após a meia-noite sem pausar.';
+                btn.textContent = 'Ativar Pausamento Automático';
+                btn.className = 'px-5 py-2.5 rounded-xl font-semibold text-sm bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-lg shadow-emerald-500/15 transition whitespace-nowrap';
+            }
+        }
+
+        async function toggleGlobalAutoPause() {
+            const btn = document.getElementById('toggleAutoPauseBtn');
+            const targetState = !currentAutoPauseEnabled;
+            btn.disabled = true;
+            btn.textContent = 'Salvando...';
+            try {
+                const res = await adminFetch('/admin/settings/auto-pause/toggle', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: targetState })
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    renderAutoPauseControl(data.auto_midnight_pause_enabled);
+                    loadMetrics();
+                    loadUsers();
+                } else {
+                    alert(data.detail || 'Não foi possível alterar o pausamento automático.');
+                    renderAutoPauseControl(currentAutoPauseEnabled);
+                }
+            } catch (e) {
+                alert('Erro de conexão ao atualizar configuração.');
+                renderAutoPauseControl(currentAutoPauseEnabled);
+            }
+        }
+
         async function loadMetrics() {
             try {
                 const res = await adminFetch('/admin/metrics');
@@ -1220,6 +1329,9 @@ async def admin_dashboard(request: Request):
                 document.getElementById('totalExchanges').textContent = `Total geral: ${data.total_exchanges}`;
                 document.getElementById('avgReciprocity').textContent = data.avg_reciprocity.toFixed(2);
                 document.getElementById('pendingReports').textContent = data.pending_reports;
+                if (typeof data.auto_midnight_pause_enabled === 'boolean') {
+                    renderAutoPauseControl(data.auto_midnight_pause_enabled);
+                }
             } catch(e) {
                 console.error("Erro ao carregar métricas", e);
             }

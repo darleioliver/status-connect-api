@@ -71,6 +71,13 @@ _POSTGRES_PUSH_STATEMENTS: List[str] = [
     "CREATE INDEX IF NOT EXISTS ix_push_campaigns_audience ON push_campaigns (audience)",
     "CREATE INDEX IF NOT EXISTS ix_push_campaigns_target_user_id ON push_campaigns (target_user_id)",
     "CREATE INDEX IF NOT EXISTS ix_push_campaigns_created_at ON push_campaigns (created_at DESC)",
+    """
+    CREATE TABLE IF NOT EXISTS app_settings (
+        key VARCHAR(80) PRIMARY KEY,
+        value VARCHAR(255) NOT NULL,
+        updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
 ]
 
 

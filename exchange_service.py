@@ -4,14 +4,62 @@ import random
 from typing import List, Tuple
 from sqlalchemy import select, func, and_, not_
 from sqlalchemy.ext.asyncio import AsyncSession
-from models import User, ContactExchange, OtpVerification, AuditLog
+from models import User, ContactExchange, OtpVerification, AuditLog, AppSetting
 from schemas import ContactDto
+from db_migrations import ensure_push_tables
+
+SETTING_AUTO_MIDNIGHT_PAUSE = "auto_midnight_pause_enabled"
+
 
 def brasilia_today_str() -> str:
     return (datetime.datetime.utcnow() - datetime.timedelta(hours=3)).strftime("%Y-%m-%d")
 
+
+async def is_midnight_auto_pause_enabled(db: AsyncSession) -> bool:
+    """Retorna se o pausamento automático à meia-noite (plano Grátis) está ativo (padrão: True)."""
+    await ensure_push_tables()
+    try:
+        async with db.begin_nested():
+            setting = await db.get(AppSetting, SETTING_AUTO_MIDNIGHT_PAUSE)
+            if not setting:
+                return True
+            return setting.value.strip().lower() in {"1", "true", "yes", "on", "sim"}
+    except Exception:
+        return True
+
+
+async def set_midnight_auto_pause_enabled(db: AsyncSession, enabled: bool) -> bool:
+    """Ativa ou desativa o pausamento automático à meia-noite pelo painel administrativo."""
+    await ensure_push_tables()
+    now = datetime.datetime.utcnow()
+    val_str = "true" if enabled else "false"
+    setting = await db.get(AppSetting, SETTING_AUTO_MIDNIGHT_PAUSE)
+    if setting:
+        setting.value = val_str
+        setting.updated_at = now
+    else:
+        db.add(AppSetting(key=SETTING_AUTO_MIDNIGHT_PAUSE, value=val_str, updated_at=now))
+
+    db.add(
+        AuditLog(
+            user_id=None,
+            action="AUTO_MIDNIGHT_PAUSE_ENABLED" if enabled else "AUTO_MIDNIGHT_PAUSE_DISABLED",
+            timestamp=now,
+            details=(
+                "Administrador ativou o pausamento automático diário às 00:00 (plano Grátis)."
+                if enabled
+                else "Administrador desativou o pausamento automático diário às 00:00 (contatos continuam sendo distribuídos)."
+            ),
+        )
+    )
+    await db.commit()
+    return enabled
+
+
 async def pause_expired_free_users(db: AsyncSession):
-    """Pausa automaticamente à meia-noite (Brasília) a distribuição de usuários do plano Grátis."""
+    """Pausa automaticamente à meia-noite (Brasília) a distribuição de usuários do plano Grátis quando ativado no painel."""
+    if not await is_midnight_auto_pause_enabled(db):
+        return
     today_str = brasilia_today_str()
     from sqlalchemy import update
     stmt = (

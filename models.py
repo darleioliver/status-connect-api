@@ -135,3 +135,11 @@ class PushCampaign(Base):
     target_user = relationship("User", foreign_keys=[target_user_id], passive_deletes=True)
 
 
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+
+    key = Column(String(80), primary_key=True)
+    value = Column(String(255), nullable=False)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+
+
