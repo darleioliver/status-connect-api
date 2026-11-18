@@ -271,12 +271,12 @@ _LEGAL_HTML = """<!DOCTYPE html>
     <section id="termos" class="card">
       <h2>2. Termos de Uso</h2>
 
-      <h3>2.1. Elegibilidade e Aceitação</h3>
+      <h3>2.1. Elegibilidade, Titularidade e Aceitação</h3>
       <p>
         Ao criar uma conta ou utilizar o aplicativo StatusZap, você declara ter <strong>18 anos ou mais</strong>
-        (ou autorização legal válida), concorda integralmente com estes Termos de Uso e com a Política
-        de Privacidade acima e autoriza voluntariamente a disponibilização do seu número aos demais
-        participantes da rede enquanto sua conta estiver ativa.
+        (ou autorização legal válida), <strong>declara ser o(a) legítimo(a) dono(a) e titular do número de WhatsApp cadastrado</strong>,
+        concorda integralmente com estes Termos de Uso e com a Política de Privacidade acima e autoriza
+        voluntariamente a disponibilização do seu número aos demais participantes da rede enquanto sua conta estiver ativa.
       </p>
 
       <h3>2.2. Funcionamento da Rede e Planos</h3>
