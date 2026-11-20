@@ -1,7 +1,7 @@
 import datetime
 import hashlib
 import random
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 from sqlalchemy import select, func, and_, not_
 from sqlalchemy.ext.asyncio import AsyncSession
 from models import User, ContactExchange, OtpVerification, AuditLog, AppSetting
@@ -9,6 +9,13 @@ from schemas import ContactDto
 from db_migrations import ensure_push_tables
 
 SETTING_AUTO_MIDNIGHT_PAUSE = "auto_midnight_pause_enabled"
+SETTING_ADS_ENABLED = "ads_enabled"
+SETTING_ADS_BANNER_ENABLED = "ads_banner_enabled"
+SETTING_ADS_INTERSTITIAL_ENABLED = "ads_interstitial_enabled"
+SETTING_ADS_INTERSTITIAL_INTERVAL = "ads_interstitial_interval"
+DEFAULT_INTERSTITIAL_INTERVAL = 4
+MIN_INTERSTITIAL_INTERVAL = 1
+MAX_INTERSTITIAL_INTERVAL = 50
 
 
 def brasilia_today_str() -> str:
@@ -54,6 +61,98 @@ async def set_midnight_auto_pause_enabled(db: AsyncSession, enabled: bool) -> bo
     )
     await db.commit()
     return enabled
+
+
+def _parse_bool_setting(raw_value: str, default: bool = True) -> bool:
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on", "sim"}
+
+
+async def _upsert_app_setting(db: AsyncSession, key: str, value: str, now: datetime.datetime) -> None:
+    setting = await db.get(AppSetting, key)
+    if setting:
+        setting.value = value
+        setting.updated_at = now
+    else:
+        db.add(AppSetting(key=key, value=value, updated_at=now))
+
+
+async def get_ads_settings(db: AsyncSession) -> Dict[str, Any]:
+    """Retorna as configurações atuais de anúncios AdMob controladas pelo painel admin."""
+    await ensure_push_tables()
+    defaults = {
+        "ads_enabled": True,
+        "ads_banner_enabled": True,
+        "ads_interstitial_enabled": True,
+        "ads_interstitial_interval": DEFAULT_INTERSTITIAL_INTERVAL,
+    }
+    try:
+        async with db.begin_nested():
+            stmt = select(AppSetting).where(
+                AppSetting.key.in_(
+                    [
+                        SETTING_ADS_ENABLED,
+                        SETTING_ADS_BANNER_ENABLED,
+                        SETTING_ADS_INTERSTITIAL_ENABLED,
+                        SETTING_ADS_INTERSTITIAL_INTERVAL,
+                    ]
+                )
+            )
+            rows = (await db.execute(stmt)).scalars().all()
+            mapping = {row.key: row.value for row in rows}
+            try:
+                raw_interval = int(mapping.get(SETTING_ADS_INTERSTITIAL_INTERVAL, str(DEFAULT_INTERSTITIAL_INTERVAL)))
+            except (TypeError, ValueError):
+                raw_interval = DEFAULT_INTERSTITIAL_INTERVAL
+            clamped_interval = max(MIN_INTERSTITIAL_INTERVAL, min(MAX_INTERSTITIAL_INTERVAL, raw_interval))
+            return {
+                "ads_enabled": _parse_bool_setting(mapping.get(SETTING_ADS_ENABLED), True),
+                "ads_banner_enabled": _parse_bool_setting(mapping.get(SETTING_ADS_BANNER_ENABLED), True),
+                "ads_interstitial_enabled": _parse_bool_setting(mapping.get(SETTING_ADS_INTERSTITIAL_ENABLED), True),
+                "ads_interstitial_interval": clamped_interval,
+            }
+    except Exception:
+        return defaults
+
+
+async def update_ads_settings(
+    db: AsyncSession,
+    ads_enabled: bool,
+    ads_banner_enabled: bool,
+    ads_interstitial_enabled: bool,
+    ads_interstitial_interval: int,
+) -> Dict[str, Any]:
+    """Salva configurações de anúncios AdMob (Banner + Intersticial + frequência) no PostgreSQL."""
+    await ensure_push_tables()
+    now = datetime.datetime.utcnow()
+    clamped_interval = max(MIN_INTERSTITIAL_INTERVAL, min(MAX_INTERSTITIAL_INTERVAL, int(ads_interstitial_interval)))
+
+    await _upsert_app_setting(db, SETTING_ADS_ENABLED, "true" if ads_enabled else "false", now)
+    await _upsert_app_setting(db, SETTING_ADS_BANNER_ENABLED, "true" if ads_banner_enabled else "false", now)
+    await _upsert_app_setting(db, SETTING_ADS_INTERSTITIAL_ENABLED, "true" if ads_interstitial_enabled else "false", now)
+    await _upsert_app_setting(db, SETTING_ADS_INTERSTITIAL_INTERVAL, str(clamped_interval), now)
+
+    db.add(
+        AuditLog(
+            user_id=None,
+            action="ADS_SETTINGS_UPDATED",
+            timestamp=now,
+            details=(
+                f"Administrador atualizou AdMob: geral={'ON' if ads_enabled else 'OFF'}, "
+                f"banner={'ON' if ads_banner_enabled else 'OFF'}, "
+                f"tela_cheia={'ON' if ads_interstitial_enabled else 'OFF'}, "
+                f"interacoes={clamped_interval}."
+            ),
+        )
+    )
+    await db.commit()
+    return {
+        "ads_enabled": bool(ads_enabled),
+        "ads_banner_enabled": bool(ads_banner_enabled),
+        "ads_interstitial_enabled": bool(ads_interstitial_enabled),
+        "ads_interstitial_interval": clamped_interval,
+    }
 
 
 async def pause_expired_free_users(db: AsyncSession):

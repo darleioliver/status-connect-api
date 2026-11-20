@@ -9,6 +9,7 @@ from sqlalchemy import desc, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db_migrations import ensure_push_tables
+from exchange_service import pause_expired_free_users
 from models import AuditLog, DeviceToken, PushCampaign, User
 
 _firebase_init_error: Optional[str] = None
@@ -135,6 +136,20 @@ async def get_tokens_for_audience(
         rows = (await db.execute(stmt)).scalars().all()
         return list(rows), "Somente usuários Premium"
 
+    if audience == "paused":
+        await pause_expired_free_users(db)
+        stmt = (
+            select(DeviceToken)
+            .join(User, DeviceToken.user_id == User.id)
+            .where(
+                DeviceToken.is_active == True,
+                User.is_active == True,
+                User.is_paused == True,
+            )
+        )
+        rows = (await db.execute(stmt)).scalars().all()
+        return list(rows), "Somente com número pausado"
+
     if audience == "free":
         stmt = (
             select(DeviceToken)
@@ -170,15 +185,35 @@ async def get_audience_counts(db: AsyncSession) -> Dict[str, int]:
     all_tokens, _ = await get_tokens_for_audience(db, "all")
     free_tokens, _ = await get_tokens_for_audience(db, "free")
     premium_tokens, _ = await get_tokens_for_audience(db, "premium")
+    paused_tokens, _ = await get_tokens_for_audience(db, "paused")
     return {
         "all": len(all_tokens),
         "free": len(free_tokens),
         "premium": len(premium_tokens),
+        "paused": len(paused_tokens),
     }
 
 
-def _send_multicast_chunk(tokens: List[str], title: str, body: str, audience: str):
+def _send_multicast_chunk(
+    tokens: List[str],
+    title: str,
+    body: str,
+    audience: str,
+    action_label: str = "",
+    action_url: str = "",
+):
     from firebase_admin import messaging
+
+    data_payload = {
+        "target_screen": "notification_detail",
+        "title": title,
+        "body": body,
+        "audience": audience,
+    }
+    if action_label:
+        data_payload["action_label"] = action_label
+    if action_url:
+        data_payload["action_url"] = action_url
 
     message = messaging.MulticastMessage(
         tokens=tokens,
@@ -195,12 +230,7 @@ def _send_multicast_chunk(tokens: List[str], title: str, body: str, audience: st
                 sound="default",
             ),
         ),
-        data={
-            "target_screen": "home",
-            "title": title,
-            "body": body,
-            "audience": audience,
-        },
+        data=data_payload,
     )
     return messaging.send_each_for_multicast(message)
 
@@ -211,11 +241,15 @@ async def send_push_campaign(
     body: str,
     audience: str = "all",
     target_user_id: Optional[int] = None,
+    action_label: Optional[str] = None,
+    action_url: Optional[str] = None,
 ) -> Dict:
     await ensure_push_tables()
     clean_title = title.strip()
     clean_body = body.strip()
-    norm_audience = audience if audience in {"all", "free", "premium", "test"} else "all"
+    clean_action_label = (action_label or "").strip()[:60]
+    clean_action_url = (action_url or "").strip()[:500]
+    norm_audience = audience if audience in {"all", "free", "premium", "paused", "test"} else "all"
 
     token_rows, target_label = await get_tokens_for_audience(db, norm_audience, target_user_id)
     unique_tokens: List[str] = []
@@ -267,7 +301,15 @@ async def send_push_campaign(
     chunk_size = 500
     for idx in range(0, total_targeted, chunk_size):
         chunk = unique_tokens[idx : idx + chunk_size]
-        batch_response = await asyncio.to_thread(_send_multicast_chunk, chunk, clean_title, clean_body, norm_audience)
+        batch_response = await asyncio.to_thread(
+            _send_multicast_chunk,
+            chunk,
+            clean_title,
+            clean_body,
+            norm_audience,
+            clean_action_label,
+            clean_action_url,
+        )
         accepted_count += int(batch_response.success_count)
         error_count += int(batch_response.failure_count)
 

@@ -18,7 +18,7 @@ from schemas import (
 from exchange_service import (
     generate_and_store_otp, verify_otp, get_reciprocal_contacts_batch,
     seed_initial_community_pool, pause_expired_free_users, brasilia_today_str,
-    is_midnight_auto_pause_enabled
+    is_midnight_auto_pause_enabled, get_ads_settings
 )
 from push_service import register_device_token
 from admin import router as admin_router
@@ -74,6 +74,7 @@ async def health_check():
 @app.get("/api/v1/network/summary", tags=["Rede"])
 async def get_network_summary(db: AsyncSession = Depends(get_db)):
     auto_pause_enabled = await is_midnight_auto_pause_enabled(db)
+    ads_settings = await get_ads_settings(db)
     await pause_expired_free_users(db)
     active_stmt = select(func.count(User.id)).where(User.is_active == True, User.is_paused == False)
     active_count = (await db.execute(active_stmt)).scalar() or 0
@@ -86,8 +87,17 @@ async def get_network_summary(db: AsyncSession = Depends(get_db)):
         "total_active_participants": active_count,
         "total_participants": total_count,
         "total_exchanges": total_exchanges,
-        "auto_midnight_pause_enabled": auto_pause_enabled
+        "auto_midnight_pause_enabled": auto_pause_enabled,
+        "ads_enabled": ads_settings["ads_enabled"],
+        "ads_banner_enabled": ads_settings["ads_banner_enabled"],
+        "ads_interstitial_enabled": ads_settings["ads_interstitial_enabled"],
+        "ads_interstitial_interval": ads_settings["ads_interstitial_interval"],
     }
+
+
+@app.get("/api/v1/ads/config", tags=["Sistema"])
+async def get_public_ads_config(db: AsyncSession = Depends(get_db)):
+    return await get_ads_settings(db)
 
 @app.get("/api/v1/network/public-contacts", response_model=List[ContactDto], tags=["Rede"])
 async def get_public_network_contacts(
@@ -101,7 +111,7 @@ async def get_public_network_contacts(
             User.is_active == True,
             User.is_paused == False
         )
-        .order_by(User.is_premium.desc(), User.id.asc())
+        .order_by(User.created_at.desc(), User.id.desc())
         .limit(limit)
     )
     users = (await db.execute(stmt)).scalars().all()
@@ -376,7 +386,7 @@ async def get_received_contacts(
         select(ContactExchange, User)
         .join(User, ContactExchange.contact_user_id == User.id)
         .where(ContactExchange.user_id == user_id)
-        .order_by(User.is_premium.desc(), ContactExchange.distributed_at.desc())
+        .order_by(ContactExchange.distributed_at.desc(), ContactExchange.id.desc())
         .offset(offset)
         .limit(limit)
     )

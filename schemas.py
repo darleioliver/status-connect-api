@@ -242,6 +242,8 @@ class DeviceTokenRegisterRequest(BaseModel):
 class PushSendRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=120)
     body: str = Field(..., min_length=1, max_length=500)
-    audience: str = Field(default="all") # all, free, premium, test
+    audience: str = Field(default="all") # all, free, premium, paused, test
     target_user_id: Optional[int] = None
+    action_label: Optional[str] = Field(default=None, max_length=60)
+    action_url: Optional[str] = Field(default=None, max_length=500)
 

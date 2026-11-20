@@ -1,7 +1,17 @@
+import os
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse
 
 router = APIRouter(tags=["Legal & Google Play"])
+
+_HOW_IT_WORKS_HTML_PATH = os.path.join(os.path.dirname(__file__), "como_funciona.html")
+_HOW_IT_WORKS_FALLBACK_HTML = """<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Como Funciona — Visualizações no Status</title></head>
+<body style="font-family:sans-serif;background:#0b141a;color:#e9edef;padding:24px;line-height:1.6;">
+<h1>Como Funciona — Visualizações no Status</h1>
+<p>Cadastre seu número, salve os contatos recebidos na agenda e publique seus Status normalmente. Você não precisa chamar ninguém no privado.</p>
+<p><a href="/privacidade" style="color:#25d366;">Política de Privacidade</a></p>
+</body></html>"""
 
 _LEGAL_HTML = """<!DOCTYPE html>
 <html lang="pt-BR">
@@ -191,6 +201,7 @@ _LEGAL_HTML = """<!DOCTYPE html>
         <span>StatusZap</span>
       </div>
       <nav class="nav-links" aria-label="Navegação legal">
+        <a href="/como-funciona">Como Funciona</a>
         <a href="#privacidade">Política de Privacidade</a>
         <a href="#termos">Termos de Uso</a>
         <a href="#exclusao">Exclusão de Dados</a>
@@ -359,6 +370,30 @@ async def legal_privacy_and_terms_page() -> HTMLResponse:
         status_code=200,
         headers={
             "Cache-Control": "public, max-age=3600",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+def _load_how_it_works_html() -> str:
+    try:
+        with open(_HOW_IT_WORKS_HTML_PATH, "r", encoding="utf-8") as fh:
+            content = fh.read().strip()
+            if content:
+                return content
+    except OSError:
+        pass
+    return _HOW_IT_WORKS_FALLBACK_HTML
+
+
+@router.get("/como-funciona", response_class=HTMLResponse, include_in_schema=False)
+@router.get("/how-it-works", response_class=HTMLResponse, include_in_schema=False)
+async def how_it_works_page() -> HTMLResponse:
+    return HTMLResponse(
+        content=_load_how_it_works_html(),
+        status_code=200,
+        headers={
+            "Cache-Control": "public, max-age=300",
             "X-Content-Type-Options": "nosniff",
         },
     )

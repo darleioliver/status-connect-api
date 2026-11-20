@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Como Funciona — Visualizações no Status</title>
+  <meta name="description" content="Entenda em poucos passos como funciona o aplicativo Visualizações no Status para aumentar as visualizações reais nos seus Status do WhatsApp." />
+  <style>
+    :root {
+      --bg: #0b141a;
+      --surface: #111b21;
+      --surface-alt: #18252d;
+      --border: #23333d;
+      --text: #e9edef;
+      --muted: #9eb0ba;
+      --accent: #25d366;
+      --accent-dark: #128c7e;
+      --gold: #f5b400;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.65;
+    }
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      background: rgba(17, 27, 33, 0.94);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--border);
+    }
+    .topbar-inner {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 14px 20px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 800;
+      font-size: 1.05rem;
+      letter-spacing: -0.01em;
+    }
+    .brand-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      border-radius: 9px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-dark));
+      color: #062112;
+      font-weight: 900;
+    }
+    .nav-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .nav-links a {
+      color: var(--text);
+      text-decoration: none;
+      font-size: 0.86rem;
+      font-weight: 600;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      transition: border-color 0.2s, color 0.2s;
+    }
+    .nav-links a:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .container {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 28px 20px 64px;
+    }
+    .hero {
+      background: linear-gradient(145deg, #111b21, #123125);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 28px 24px;
+      margin-bottom: 24px;
+    }
+    .pill {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      background: rgba(37, 211, 102, 0.14);
+      color: var(--accent);
+      border: 1px solid rgba(37, 211, 102, 0.35);
+      margin-bottom: 10px;
+    }
+    .hero h1 {
+      margin: 0 0 10px;
+      font-size: 1.75rem;
+      line-height: 1.25;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 24px;
+      margin-bottom: 20px;
+    }
+    .card h2 {
+      margin: 0 0 14px;
+      font-size: 1.3rem;
+      color: var(--accent);
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 10px;
+    }
+    p {
+      margin: 0 0 12px;
+      color: #d6dfe4;
+    }
+    ul {
+      margin: 6px 0 14px;
+      padding-left: 20px;
+      color: #d6dfe4;
+    }
+    li { margin-bottom: 8px; }
+    .steps-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 14px;
+      margin-top: 14px;
+    }
+    .step-box {
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+    }
+    .step-number {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: #062112;
+      font-weight: 900;
+      font-size: 0.9rem;
+      margin-bottom: 10px;
+    }
+    .step-box h3 {
+      margin: 0 0 6px;
+      font-size: 1rem;
+      color: #ffffff;
+    }
+    .step-box p {
+      margin: 0;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+    .highlight-box {
+      background: rgba(37, 211, 102, 0.08);
+      border-left: 4px solid var(--accent);
+      border-radius: 10px;
+      padding: 16px 18px;
+      margin: 14px 0;
+    }
+    .warning-box {
+      background: rgba(245, 180, 0, 0.09);
+      border-left: 4px solid var(--gold);
+      border-radius: 10px;
+      padding: 16px 18px;
+      margin: 14px 0;
+    }
+    .plans-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+      margin-top: 12px;
+    }
+    .plan-card {
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px;
+    }
+    .plan-card.premium {
+      border-color: var(--gold);
+      background: linear-gradient(160deg, rgba(245, 180, 0, 0.12), var(--surface-alt));
+    }
+    .plan-card h3 {
+      margin: 0 0 10px;
+      font-size: 1.08rem;
+      color: #ffffff;
+    }
+    .plan-card.premium h3 {
+      color: var(--gold);
+    }
+    .cta-btn {
+      display: inline-block;
+      margin-top: 8px;
+      padding: 12px 20px;
+      border-radius: 12px;
+      background: var(--accent);
+      color: #062112;
+      font-weight: 800;
+      text-decoration: none;
+    }
+    .cta-btn:hover {
+      opacity: 0.92;
+    }
+    a.inline-link {
+      color: var(--accent);
+      text-decoration: underline;
+    }
+    footer {
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.85rem;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+    }
+    @media (max-width: 600px) {
+      .hero h1 { font-size: 1.42rem; }
+      .card { padding: 18px; }
+    }
+  </style>
+</head>
+<body>
+  <!-- Página simples e editável: você pode editar textos, links ou cores e subir no GitHub / Railway -->
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-badge">VS</span>
+        <span>Visualizações no Status</span>
+      </div>
+      <nav class="nav-links" aria-label="Navegação">
+        <a href="#passo-a-passo">Passo a Passo</a>
+        <a href="#nao-chamar">Regra de Ouro</a>
+        <a href="#planos">Grátis vs Premium</a>
+        <a href="/privacidade">Privacidade</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <span class="pill">Guia Rápido</span>
+      <h1>Como Funciona o Visualizações no Status</h1>
+      <p>
+        O <strong>Visualizações no Status</strong> conecta pessoas reais que desejam aumentar o alcance
+        orgânico dos seus Status no WhatsApp de forma voluntária, simples e recíproca.
+      </p>
+      <p>
+        No WhatsApp, duas pessoas só enxergam os Status uma da outra quando <strong>ambas têm o número salvo na agenda</strong>.
+        Nosso aplicativo facilita essa troca justa entre participantes ativos da comunidade.
+      </p>
+    </section>
+
+    <section id="passo-a-passo" class="card">
+      <h2>1. Passo a Passo em 4 Etapas</h2>
+      <div class="steps-grid">
+        <div class="step-box">
+          <div class="step-number">1</div>
+          <h3>Faça seu Cadastro</h3>
+          <p>Informe seu nome, número de WhatsApp, uma bio curta, seu Estado (UF) e sexo para entrar na rede.</p>
+        </div>
+        <div class="step-box">
+          <div class="step-number">2</div>
+          <h3>Salve os Contatos</h3>
+          <p>Toque em <strong>Salvar Todos os Contatos</strong> na tela inicial para adicionar os participantes na sua agenda de uma só vez.</p>
+        </div>
+        <div class="step-box">
+          <div class="step-number">3</div>
+          <h3>Receba Reciprocidade</h3>
+          <p>Enquanto sua conta estiver ativa, seu número também é entregue para outros participantes salvarem na agenda deles.</p>
+        </div>
+        <div class="step-box">
+          <div class="step-number">4</div>
+          <h3>Poste seus Status</h3>
+          <p>Publique seus Status normalmente no WhatsApp e acompanhe suas visualizações crescerem de forma orgânica.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="nao-chamar" class="card">
+      <h2>2. Regra de Ouro: Você Não Precisa Chamar Ninguém</h2>
+      <div class="warning-box">
+        <strong>Atenção:</strong> Você <strong>não precisa enviar mensagem nem chamar ninguém no privado</strong>
+        para que os Status apareçam!
+      </div>
+      <p>
+        Basta <strong>salvar o número na agenda do celular</strong>. Assim que a outra pessoa também salvar o seu contato,
+        os Status de ambos aparecerão automaticamente na aba <em>Atualizações / Status</em> do WhatsApp.
+      </p>
+      <p>
+        Evite enviar spam ou mensagens em massa sem consentimento — contas denunciadas por abuso podem ser pausadas ou removidas pela moderação.
+      </p>
+    </section>
+
+    <section id="planos" class="card">
+      <h2>3. Plano Grátis vs. ★ Premium</h2>
+      <div class="plans-grid">
+        <div class="plan-card">
+          <h3>Plano Grátis</h3>
+          <ul>
+            <li>Participação gratuita na rede de troca recíproca.</li>
+            <li>Botão <strong>Salvar Todos</strong> para adicionar os contatos da rede em lote.</li>
+            <li>A divulgação pausa automaticamente às <strong>00:00 (horário de Brasília)</strong> — basta abrir o app e reativar em 1 toque no dia seguinte.</li>
+            <li>Exibe anúncios para manter o servidor gratuito.</li>
+          </ul>
+        </div>
+        <div class="plan-card premium">
+          <h3>★ Plano Premium</h3>
+          <ul>
+            <li><strong>Ativo 24 horas:</strong> seu número não pausa à meia-noite e continua sendo distribuído todos os dias.</li>
+            <li><strong>Salvar Individualmente:</strong> salve contatos específicos um a um quando quiser.</li>
+            <li><strong>Filtros Exclusivos:</strong> salve contatos filtrados por <strong>Sexo</strong> ou por <strong>Estado / Região</strong>.</li>
+            <li><strong>Destaque Dourado:</strong> seu perfil aparece com selo ★ PREMIUM em destaque na lista de contatos.</li>
+            <li><strong>100% Sem Anúncios:</strong> navegação limpa, sem banners nem telas de propaganda.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section id="privacidade-suporte" class="card">
+      <h2>4. Privacidade, Controle e Suporte</h2>
+      <div class="highlight-box">
+        <strong>Você está sempre no controle:</strong> na aba <em>Ajustes</em> do aplicativo você pode
+        <strong>pausar</strong> o compartilhamento do seu número a qualquer momento ou <strong>excluir sua conta</strong>
+        definitivamente em conformidade com a LGPD.
+      </div>
+      <p>
+        O aplicativo <strong>não</strong> lê suas conversas privadas, <strong>não</strong> acessa sua agenda pessoal
+        sem autorização e não possui vínculo oficial com o WhatsApp LLC ou a Meta Platforms, Inc.
+      </p>
+      <p>
+        Consulte também nossa <a class="inline-link" href="/privacidade">Política de Privacidade e Termos de Uso</a>.
+      </p>
+      <p>
+        Ficou com alguma dúvida ou precisa de ajuda com o plano Premium?
+      </p>
+      <a class="cta-btn" href="https://wa.me/557799736034?text=Ol%C3%A1!%20Vim%20da%20p%C3%A1gina%20Como%20Funciona%20do%20Visualiza%C3%A7%C3%B5es%20no%20Status.">
+        Falar com o Suporte no WhatsApp
+      </a>
+    </section>
+
+    <footer>
+      Visualizações no Status &copy; 2026 — Todos os direitos reservados.
+    </footer>
+  </main>
+</body>
+</html>

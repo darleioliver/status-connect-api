@@ -23,6 +23,8 @@ from exchange_service import (
     pause_expired_free_users,
     is_midnight_auto_pause_enabled,
     set_midnight_auto_pause_enabled,
+    get_ads_settings,
+    update_ads_settings,
 )
 from push_service import ensure_firebase_initialized, get_audience_counts, send_push_campaign
 
@@ -52,6 +54,13 @@ class AdminLoginRequest(BaseModel):
 
 class AutoPauseToggleRequest(BaseModel):
     enabled: Optional[bool] = None
+
+
+class AdsSettingsUpdateRequest(BaseModel):
+    ads_enabled: bool = True
+    ads_banner_enabled: bool = True
+    ads_interstitial_enabled: bool = True
+    ads_interstitial_interval: int = Field(default=4, ge=1, le=50)
 
 
 def _get_configured_admin_secret() -> str:
@@ -445,6 +454,7 @@ async def admin_logout(
 @router.get("/metrics", dependencies=[Depends(require_admin_read)])
 async def get_admin_metrics(db: AsyncSession = Depends(get_db)):
     auto_pause_enabled = await is_midnight_auto_pause_enabled(db)
+    ads_settings = await get_ads_settings(db)
     await pause_expired_free_users(db)
     total_users = (await db.execute(select(func.count(User.id)))).scalar() or 0
     active_users = (await db.execute(select(func.count(User.id)).where(User.is_active == True, User.is_paused == False))).scalar() or 0
@@ -466,7 +476,8 @@ async def get_admin_metrics(db: AsyncSession = Depends(get_db)):
         "today_exchanges": today_exchanges,
         "pending_reports": pending_reports,
         "avg_reciprocity": round(float(avg_reciprocity), 2),
-        "auto_midnight_pause_enabled": auto_pause_enabled
+        "auto_midnight_pause_enabled": auto_pause_enabled,
+        "ads_settings": ads_settings,
     }
 
 
@@ -493,6 +504,34 @@ async def toggle_auto_pause_setting(
             "Pausamento automático à meia-noite (00:00) ATIVADO. O app continua operando normalmente para o plano Grátis."
             if target
             else "Pausamento automático à meia-noite DESATIVADO. Os contatos não param de ser distribuídos às 00:00."
+        ),
+    }
+
+
+@router.get("/settings/ads", dependencies=[Depends(require_admin_read)])
+async def get_admin_ads_settings(db: AsyncSession = Depends(get_db)):
+    return await get_ads_settings(db)
+
+
+@router.post("/settings/ads", dependencies=[Depends(require_admin_write)])
+async def save_admin_ads_settings(
+    payload: AdsSettingsUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    updated = await update_ads_settings(
+        db=db,
+        ads_enabled=payload.ads_enabled,
+        ads_banner_enabled=payload.ads_banner_enabled,
+        ads_interstitial_enabled=payload.ads_interstitial_enabled,
+        ads_interstitial_interval=payload.ads_interstitial_interval,
+    )
+    return {
+        "success": True,
+        "ads_settings": updated,
+        "message": (
+            f"Configuração de anúncios salva! Tela cheia a cada {updated['ads_interstitial_interval']} interações."
+            if updated["ads_enabled"] and updated["ads_interstitial_enabled"]
+            else "Configuração de anúncios AdMob atualizada com sucesso."
         ),
     }
 
@@ -642,7 +681,9 @@ async def send_test_push(
             title=payload.title,
             body=payload.body,
             audience="test",
-            target_user_id=payload.target_user_id
+            target_user_id=payload.target_user_id,
+            action_label=payload.action_label,
+            action_url=payload.action_url
         )
         return result
     except RuntimeError as exc:
@@ -654,48 +695,125 @@ async def send_bulk_push(
     db: AsyncSession = Depends(get_db)
 ):
     await ensure_push_tables()
-    audience = payload.audience if payload.audience in {"all", "free", "premium"} else "all"
+    audience = payload.audience if payload.audience in {"all", "free", "premium", "paused"} else "all"
     try:
         result = await send_push_campaign(
             db=db,
             title=payload.title,
             body=payload.body,
             audience=audience,
-            target_user_id=None
+            target_user_id=None,
+            action_label=payload.action_label,
+            action_url=payload.action_url
         )
         return result
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
 @router.get("/reports", dependencies=[Depends(require_admin_read)])
-async def list_reports(db: AsyncSession = Depends(get_db)):
-    res = await db.execute(select(Report).order_by(desc(Report.created_at)).limit(50))
-    reports = res.scalars().all()
-    return [
-        {
+async def list_reports(
+    status: Optional[str] = Query(default="all"),
+    limit: int = Query(default=100, ge=1, le=200),
+    db: AsyncSession = Depends(get_db)
+):
+    stmt = select(Report)
+    norm_status = (status or "all").strip().lower()
+    if norm_status in {"pending", "resolved", "dismissed"}:
+        stmt = stmt.where(Report.status == norm_status)
+    stmt = stmt.order_by(desc(Report.created_at)).limit(limit)
+
+    res = await db.execute(stmt)
+    reports = list(res.scalars().all())
+    # Prioriza denúncias pendentes no topo mantendo mais recentes primeiro
+    reports.sort(key=lambda r: (0 if r.status == "pending" else 1, -(r.created_at.timestamp() if r.created_at else 0)))
+
+    user_ids = set()
+    for r in reports:
+        if r.reported_user_id:
+            user_ids.add(r.reported_user_id)
+        if r.reporter_user_id:
+            user_ids.add(r.reporter_user_id)
+
+    users_map: Dict[int, User] = {}
+    if user_ids:
+        u_res = await db.execute(select(User).where(User.id.in_(list(user_ids))))
+        for u in u_res.scalars().all():
+            users_map[u.id] = u
+
+    result = []
+    for r in reports:
+        reported = users_map.get(r.reported_user_id) if r.reported_user_id else None
+        reporter = users_map.get(r.reporter_user_id) if r.reporter_user_id else None
+        result.append({
             "id": r.id,
             "reporter_user_id": r.reporter_user_id,
+            "reporter_name": reporter.name if reporter else "Visitante / Anônimo",
+            "reporter_phone": reporter.phone_e164 if reporter else "",
             "reported_user_id": r.reported_user_id,
+            "reported_name": reported.name if reported else f"Usuário #{r.reported_user_id}",
+            "reported_phone": reported.phone_e164 if reported else "",
+            "reported_is_active": bool(reported.is_active) if reported else False,
+            "reported_is_paused": bool(reported.is_paused) if reported else False,
+            "reported_is_premium": bool(reported.is_premium) if reported else False,
             "reason": r.reason,
-            "details": r.details,
+            "details": r.details or "",
             "status": r.status,
-            "created_at": r.created_at.isoformat()
-        }
-        for r in reports
-    ]
+            "created_at": r.created_at.isoformat() if r.created_at else ""
+        })
+    return result
 
 @router.post("/reports/{report_id}/resolve", dependencies=[Depends(require_admin_write)])
 async def resolve_report(report_id: int, action: str = "resolve", db: AsyncSession = Depends(get_db)):
     report = await db.get(Report, report_id)
     if not report:
         raise HTTPException(status_code=404, detail="Denúncia não encontrada.")
-    report.status = "resolved"
-    if action == "ban":
-        reported_user = await db.get(User, report.reported_user_id)
+
+    norm_action = (action or "resolve").strip().lower()
+    reported_user = await db.get(User, report.reported_user_id) if report.reported_user_id else None
+    now = datetime.datetime.utcnow()
+
+    if norm_action == "ban":
+        report.status = "resolved"
         if reported_user:
             reported_user.is_active = False
+        msg = "Usuário denunciado bloqueado e denúncia marcada como resolvida."
+        audit_detail = f"Denúncia #{report.id}: usuário #{report.reported_user_id} bloqueado."
+    elif norm_action == "pause":
+        report.status = "resolved"
+        if reported_user:
+            reported_user.is_paused = True
+        msg = "Distribuição do usuário denunciado pausada e denúncia resolvida."
+        audit_detail = f"Denúncia #{report.id}: usuário #{report.reported_user_id} pausado."
+    elif norm_action == "dismiss":
+        report.status = "dismissed"
+        msg = "Denúncia descartada sem punição ao usuário."
+        audit_detail = f"Denúncia #{report.id} descartada."
+    elif norm_action == "reopen":
+        report.status = "pending"
+        msg = "Denúncia reaberta como pendente."
+        audit_detail = f"Denúncia #{report.id} reaberta."
+    else:
+        report.status = "resolved"
+        msg = "Denúncia marcada como resolvida."
+        audit_detail = f"Denúncia #{report.id} marcada como resolvida."
+
+    db.add(AuditLog(
+        user_id=report.reported_user_id,
+        action=f"ADMIN_REPORT_{norm_action.upper()}",
+        timestamp=now,
+        details=audit_detail
+    ))
     await db.commit()
-    return {"message": "Denúncia processada."}
+    return {"message": msg, "status": report.status}
+
+@router.delete("/reports/{report_id}", dependencies=[Depends(require_admin_write)])
+async def delete_report(report_id: int, db: AsyncSession = Depends(get_db)):
+    report = await db.get(Report, report_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="Denúncia não encontrada.")
+    await db.delete(report)
+    await db.commit()
+    return {"message": "Registro de denúncia excluído."}
 
 @router.get("/dashboard", response_class=HTMLResponse)
 async def admin_dashboard(request: Request):
@@ -770,11 +888,11 @@ async def admin_dashboard(request: Request):
                 <p id="avgReciprocity" class="text-3xl font-bold text-sky-400 mt-2">--</p>
                 <p class="text-xs text-slate-400 mt-1">Meta do algoritmo: 1.0 (Equilíbrio)</p>
             </div>
-            <div class="bg-slate-800/80 border border-slate-700/80 rounded-2xl p-5 shadow-sm">
-                <p class="text-xs font-medium text-slate-400 uppercase tracking-wider">Denúncias Pendentes</p>
+            <button type="button" onclick="scrollToReportsSection()" class="text-left bg-slate-800/80 hover:bg-slate-800 border border-amber-500/40 hover:border-amber-400 rounded-2xl p-5 shadow-sm transition cursor-pointer">
+                <p class="text-xs font-medium text-amber-300 uppercase tracking-wider">Denúncias Pendentes</p>
                 <p id="pendingReports" class="text-3xl font-bold text-amber-400 mt-2">--</p>
-                <p class="text-xs text-slate-400 mt-1">Moderação de contatos abusivos</p>
-            </div>
+                <p class="text-xs text-slate-400 mt-1">Clique para gerenciar denúncias ↓</p>
+            </button>
         </div>
 
         <!-- Controle Global: Pausamento Automático à Meia-Noite (00:00) -->
@@ -796,6 +914,71 @@ async def admin_dashboard(request: Request):
                     Carregando...
                 </button>
             </div>
+        </section>
+
+        <!-- Controle Global: Anúncios (Google AdMob) -->
+        <section class="bg-slate-800/80 border border-sky-700/40 rounded-2xl p-6 shadow-sm space-y-5">
+            <div class="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-slate-700/70 pb-4">
+                <div>
+                    <div class="flex flex-wrap items-center gap-2.5">
+                        <h2 class="text-base font-semibold text-white">Anúncios do Aplicativo (Google AdMob)</h2>
+                        <span id="adsStatusBadge" class="text-xs font-bold px-2.5 py-0.5 rounded-full bg-slate-700 text-slate-300 border border-slate-600">
+                            Carregando...
+                        </span>
+                    </div>
+                    <p class="text-xs text-slate-400 mt-1">
+                        Controle o banner inferior e a frequência de anúncios em tela cheia (intersticial). Usuários <span class="text-amber-300 font-semibold">★ Premium</span> nunca veem anúncios.
+                    </p>
+                </div>
+                <button id="saveAdsBtn" onclick="saveAdsSettings()" disabled
+                        class="px-5 py-2.5 rounded-xl font-semibold text-sm bg-sky-500 hover:bg-sky-400 text-slate-950 shadow-lg shadow-sky-500/15 transition whitespace-nowrap">
+                    Salvar Configuração de Anúncios
+                </button>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                <label class="flex items-center justify-between gap-3 rounded-xl bg-slate-900/80 border border-slate-700/80 px-4 py-3 cursor-pointer">
+                    <div>
+                        <p class="text-sm font-semibold text-white">Anúncios Ativos</p>
+                        <p class="text-[11px] text-slate-400">Chave geral do AdMob</p>
+                    </div>
+                    <input id="adsEnabledToggle" type="checkbox" checked class="w-5 h-5 accent-emerald-500 rounded">
+                </label>
+
+                <label class="flex items-center justify-between gap-3 rounded-xl bg-slate-900/80 border border-slate-700/80 px-4 py-3 cursor-pointer">
+                    <div>
+                        <p class="text-sm font-semibold text-white">Banner Inferior</p>
+                        <p class="text-[11px] text-slate-400">Fixo na parte de baixo</p>
+                    </div>
+                    <input id="adsBannerToggle" type="checkbox" checked class="w-5 h-5 accent-emerald-500 rounded">
+                </label>
+
+                <label class="flex items-center justify-between gap-3 rounded-xl bg-slate-900/80 border border-slate-700/80 px-4 py-3 cursor-pointer">
+                    <div>
+                        <p class="text-sm font-semibold text-white">Tela Cheia</p>
+                        <p class="text-[11px] text-slate-400">Intersticial por interações</p>
+                    </div>
+                    <input id="adsInterstitialToggle" type="checkbox" checked class="w-5 h-5 accent-emerald-500 rounded">
+                </label>
+
+                <div class="rounded-xl bg-slate-900/80 border border-slate-700/80 px-4 py-3 space-y-2">
+                    <div class="flex items-center justify-between gap-2">
+                        <label for="adsIntervalInput" class="text-xs font-semibold text-slate-200">
+                            Interações p/ Tela Cheia
+                        </label>
+                        <input id="adsIntervalInput" type="number" min="1" max="50" value="4"
+                               class="w-16 bg-slate-950 border border-slate-600 rounded-lg px-2 py-1 text-center text-sm font-bold text-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-500">
+                    </div>
+                    <div class="flex flex-wrap gap-1.5">
+                        <button type="button" onclick="setAdsIntervalPreset(2)" class="text-[11px] px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700">2x</button>
+                        <button type="button" onclick="setAdsIntervalPreset(3)" class="text-[11px] px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700">3x</button>
+                        <button type="button" onclick="setAdsIntervalPreset(4)" class="text-[11px] px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700">4x</button>
+                        <button type="button" onclick="setAdsIntervalPreset(6)" class="text-[11px] px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700">6x</button>
+                        <button type="button" onclick="setAdsIntervalPreset(10)" class="text-[11px] px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700">10x</button>
+                    </div>
+                </div>
+            </div>
+            <div id="adsSaveFeedback" class="hidden rounded-xl px-4 py-2.5 text-xs font-medium"></div>
         </section>
 
         <!-- Seção de Notificações Push (Firebase FCM) -->
@@ -835,10 +1018,30 @@ async def admin_dashboard(request: Request):
                                   class="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500"></textarea>
                     </div>
 
+                    <!-- Botão de ação opcional na tela exclusiva de notificação -->
+                    <div class="bg-slate-900/60 border border-slate-700/80 rounded-xl p-3.5 space-y-2.5">
+                        <div class="flex flex-wrap items-center justify-between gap-2">
+                            <span class="text-xs font-semibold uppercase tracking-wider text-emerald-400">Botão na Tela de Comunicado (Opcional)</span>
+                            <div class="flex items-center gap-1.5">
+                                <button type="button" onclick="applyPushPlansPreset()" class="text-[11px] px-2 py-0.5 rounded bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/40 transition">★ Planos Premium</button>
+                                <button type="button" onclick="clearPushActionPreset()" class="text-[11px] px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition">Limpar</button>
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                            <input id="pushActionLabelInput" type="text" maxlength="60" oninput="updatePushPreview()"
+                                   placeholder="Texto do botão (ex.: Ver Planos)"
+                                   class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                            <input id="pushActionUrlInput" type="text" maxlength="500" oninput="updatePushPreview()"
+                                   placeholder="Link https://... ou digite plans"
+                                   class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                        </div>
+                        <p class="text-[11px] text-slate-400">Se preenchido, o botão aparecerá na tela exclusiva aberta quando o usuário tocar na notificação.</p>
+                    </div>
+
                     <!-- Destinatários -->
                     <div>
                         <label class="text-xs font-semibold uppercase tracking-wider text-slate-300 block mb-2">Destinatários</label>
-                        <div class="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                             <label class="cursor-pointer bg-slate-900/80 border border-slate-700 rounded-xl p-3 flex items-center justify-between hover:border-emerald-500/60 transition">
                                 <div class="flex items-center gap-2">
                                     <input type="radio" name="pushAudience" value="all" checked class="accent-emerald-500">
@@ -859,6 +1062,13 @@ async def admin_dashboard(request: Request):
                                     <span class="text-sm font-medium text-amber-300">Somente Premium</span>
                                 </div>
                                 <span id="countPremium" class="text-xs font-bold text-amber-300">--</span>
+                            </label>
+                            <label class="cursor-pointer bg-slate-900/80 border border-orange-500/40 rounded-xl p-3 flex items-center justify-between hover:border-orange-400 transition">
+                                <div class="flex items-center gap-2">
+                                    <input type="radio" name="pushAudience" value="paused" class="accent-orange-400">
+                                    <span class="text-sm font-medium text-orange-300">Somente Pausados</span>
+                                </div>
+                                <span id="countPaused" class="text-xs font-bold text-orange-300">--</span>
                             </label>
                         </div>
                     </div>
@@ -911,9 +1121,12 @@ async def admin_dashboard(request: Request):
                                     </div>
                                     <p id="previewTitle" class="text-sm font-bold text-white mt-0.5 break-words">Título da notificação</p>
                                     <p id="previewBody" class="text-xs text-slate-300 mt-1 whitespace-pre-wrap break-words">A mensagem aparecerá aqui exatamente como será exibida antes de enviar.</p>
+                                    <div id="previewActionWrap" class="hidden mt-2 pt-2 border-t border-slate-800">
+                                        <span id="previewActionPill" class="inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">Abrir Link</span>
+                                    </div>
                                 </div>
                             </div>
-                            <p class="text-[11px] text-slate-500">Ao tocar na notificação, o app StatusZap abre na tela inicial.</p>
+                            <p class="text-[11px] text-slate-500">Ao tocar na notificação, o app abre a <strong>Tela Exclusiva de Comunicado</strong> com título, mensagem completa e botão opcional.</p>
                         </div>
                     </div>
 
@@ -952,6 +1165,53 @@ async def admin_dashboard(request: Request):
                         </tbody>
                     </table>
                 </div>
+            </div>
+        </section>
+
+        <!-- Seção de Moderação de Denúncias -->
+        <section id="reportsSection" class="bg-slate-800/80 border border-amber-600/40 rounded-2xl p-6 shadow-sm space-y-4">
+            <div class="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div>
+                    <div class="flex flex-wrap items-center gap-2.5">
+                        <h2 class="text-lg font-semibold text-white">Moderação de Denúncias</h2>
+                        <span id="reportsSectionBadge" class="text-xs font-bold px-2.5 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40">
+                            Carregando...
+                        </span>
+                    </div>
+                    <p class="text-sm text-slate-400 mt-0.5">Analise denúncias enviadas pelos participantes e bloqueie, pause, resolva ou descarte cada caso.</p>
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                    <select id="reportsStatusFilter" onchange="loadReports()" class="bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs font-semibold text-white focus:outline-none focus:ring-2 focus:ring-amber-500">
+                        <option value="all">Todas as denúncias</option>
+                        <option value="pending" selected>Somente pendentes</option>
+                        <option value="resolved">Resolvidas</option>
+                        <option value="dismissed">Descartadas</option>
+                    </select>
+                    <button onclick="loadReports()" class="px-3.5 py-2 rounded-xl bg-slate-700 hover:bg-slate-600 text-slate-200 text-xs font-semibold transition">
+                        Atualizar
+                    </button>
+                </div>
+            </div>
+
+            <div id="reportsFeedback" class="hidden rounded-xl px-4 py-2.5 text-xs font-medium"></div>
+
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs text-slate-300">
+                    <thead class="bg-slate-900/60 uppercase text-slate-400 border-b border-slate-700">
+                        <tr>
+                            <th class="py-3 px-3">Data / Status</th>
+                            <th class="py-3 px-3">Usuário Denunciado</th>
+                            <th class="py-3 px-3">Motivo &amp; Detalhes</th>
+                            <th class="py-3 px-3">Denunciado Por</th>
+                            <th class="py-3 px-3 text-right">Ações</th>
+                        </tr>
+                    </thead>
+                    <tbody id="reportsTableBody" class="divide-y divide-slate-700/60">
+                        <tr>
+                            <td colspan="5" class="text-center py-6 text-slate-500">Carregando denúncias...</td>
+                        </tr>
+                    </tbody>
+                </table>
             </div>
         </section>
 
@@ -1056,13 +1316,38 @@ async def admin_dashboard(request: Request):
             }
         }
 
+        function applyPushPlansPreset() {
+            document.getElementById('pushActionLabelInput').value = 'Ver Planos Premium';
+            document.getElementById('pushActionUrlInput').value = 'plans';
+            updatePushPreview();
+        }
+
+        function clearPushActionPreset() {
+            document.getElementById('pushActionLabelInput').value = '';
+            document.getElementById('pushActionUrlInput').value = '';
+            updatePushPreview();
+        }
+
         function updatePushPreview() {
             const title = document.getElementById('pushTitleInput').value;
             const body = document.getElementById('pushBodyInput').value;
+            const actionLabel = (document.getElementById('pushActionLabelInput')?.value || '').trim();
+            const actionUrl = (document.getElementById('pushActionUrlInput')?.value || '').trim();
             document.getElementById('titleCounter').textContent = `${title.length}/120`;
             document.getElementById('bodyCounter').textContent = `${body.length}/500`;
             document.getElementById('previewTitle').textContent = title.trim() || 'Título da notificação';
             document.getElementById('previewBody').textContent = body.trim() || 'A mensagem aparecerá aqui exatamente como será exibida antes de enviar.';
+            const wrap = document.getElementById('previewActionWrap');
+            const pill = document.getElementById('previewActionPill');
+            if (wrap && pill) {
+                if (actionUrl) {
+                    const isPlans = ['plans', 'premium', 'planos'].includes(actionUrl.toLowerCase());
+                    pill.textContent = actionLabel || (isPlans ? 'Ver Planos Premium' : 'Abrir Link');
+                    wrap.classList.remove('hidden');
+                } else {
+                    wrap.classList.add('hidden');
+                }
+            }
         }
 
         function showPushResult(isOk, htmlMessage) {
@@ -1079,6 +1364,7 @@ async def admin_dashboard(request: Request):
         function audienceLabel(aud) {
             if (aud === 'premium') return 'Somente usuários Premium';
             if (aud === 'free') return 'Somente usuários Grátis';
+            if (aud === 'paused') return 'Somente com número pausado';
             if (aud === 'test') return 'Teste individual';
             return 'Todos os usuários';
         }
@@ -1097,6 +1383,8 @@ async def admin_dashboard(request: Request):
                 document.getElementById('countAll').textContent = counts.all ?? 0;
                 document.getElementById('countFree').textContent = counts.free ?? 0;
                 document.getElementById('countPremium').textContent = counts.premium ?? 0;
+                const countPausedEl = document.getElementById('countPaused');
+                if (countPausedEl) countPausedEl.textContent = counts.paused ?? 0;
 
                 if (data.firebase_configured) {
                     badge.textContent = 'Firebase Admin Conectado';
@@ -1130,6 +1418,8 @@ async def admin_dashboard(request: Request):
                         ? '<span class="px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300">Premium</span>'
                         : r.audience === 'free'
                         ? '<span class="px-2 py-0.5 rounded-full bg-slate-700 text-slate-200">Grátis</span>'
+                        : r.audience === 'paused'
+                        ? '<span class="px-2 py-0.5 rounded-full bg-orange-500/20 text-orange-300">Pausados</span>'
                         : r.audience === 'test'
                         ? `<span class="px-2 py-0.5 rounded-full bg-sky-500/20 text-sky-300">Teste (${escapeHtml(r.target_user_label)})</span>`
                         : '<span class="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300">Todos</span>';
@@ -1176,6 +1466,8 @@ async def admin_dashboard(request: Request):
         async function sendTestPush() {
             const title = document.getElementById('pushTitleInput').value.trim();
             const body = document.getElementById('pushBodyInput').value.trim();
+            const actionLabel = (document.getElementById('pushActionLabelInput')?.value || '').trim();
+            const actionUrl = (document.getElementById('pushActionUrlInput')?.value || '').trim();
             const targetUserId = Number(document.getElementById('testUserSelect').value || 0);
 
             if (!title || !body) {
@@ -1195,7 +1487,9 @@ async def admin_dashboard(request: Request):
                         title,
                         body,
                         audience: 'test',
-                        target_user_id: targetUserId
+                        target_user_id: targetUserId,
+                        action_label: actionLabel || null,
+                        action_url: actionUrl || null
                     })
                 });
                 const data = await res.json();
@@ -1222,7 +1516,8 @@ async def admin_dashboard(request: Request):
             const countMap = {
                 all: document.getElementById('countAll').textContent,
                 free: document.getElementById('countFree').textContent,
-                premium: document.getElementById('countPremium').textContent
+                premium: document.getElementById('countPremium').textContent,
+                paused: document.getElementById('countPaused').textContent
             };
             document.getElementById('confirmAudienceLabel').textContent = audienceLabel(aud);
             document.getElementById('confirmAudienceCount').textContent = countMap[aud] || '--';
@@ -1238,6 +1533,8 @@ async def admin_dashboard(request: Request):
         async function confirmBulkPushSend() {
             const title = document.getElementById('pushTitleInput').value.trim();
             const body = document.getElementById('pushBodyInput').value.trim();
+            const actionLabel = (document.getElementById('pushActionLabelInput')?.value || '').trim();
+            const actionUrl = (document.getElementById('pushActionUrlInput')?.value || '').trim();
             const aud = document.querySelector('input[name="pushAudience"]:checked').value;
             const btn = document.getElementById('confirmSendBtn');
             btn.disabled = true;
@@ -1247,7 +1544,13 @@ async def admin_dashboard(request: Request):
                 const res = await adminFetch('/admin/push/send', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ title, body, audience: aud })
+                    body: JSON.stringify({
+                        title,
+                        body,
+                        audience: aud,
+                        action_label: actionLabel || null,
+                        action_url: actionUrl || null
+                    })
                 });
                 const data = await res.json();
                 closeBulkPushConfirm();
@@ -1318,6 +1621,98 @@ async def admin_dashboard(request: Request):
             }
         }
 
+        let adsConfigLoadedOnce = false;
+
+        function setAdsIntervalPreset(value) {
+            const input = document.getElementById('adsIntervalInput');
+            if (input) input.value = value;
+        }
+
+        function renderAdsControl(settings, forceSyncInputs = false) {
+            if (!settings) return;
+            const badge = document.getElementById('adsStatusBadge');
+            const saveBtn = document.getElementById('saveAdsBtn');
+            const enabledEl = document.getElementById('adsEnabledToggle');
+            const bannerEl = document.getElementById('adsBannerToggle');
+            const interstitialEl = document.getElementById('adsInterstitialToggle');
+            const intervalEl = document.getElementById('adsIntervalInput');
+
+            if (saveBtn) saveBtn.disabled = false;
+
+            if (!adsConfigLoadedOnce || forceSyncInputs) {
+                if (enabledEl) enabledEl.checked = Boolean(settings.ads_enabled);
+                if (bannerEl) bannerEl.checked = Boolean(settings.ads_banner_enabled);
+                if (interstitialEl) interstitialEl.checked = Boolean(settings.ads_interstitial_enabled);
+                if (intervalEl) intervalEl.value = Number(settings.ads_interstitial_interval || 4);
+                adsConfigLoadedOnce = true;
+            }
+
+            if (badge) {
+                if (!settings.ads_enabled) {
+                    badge.textContent = 'DESATIVADOS';
+                    badge.className = 'text-xs font-bold px-2.5 py-0.5 rounded-full bg-rose-500/20 text-rose-300 border border-rose-500/40';
+                } else {
+                    const parts = [];
+                    if (settings.ads_banner_enabled) parts.push('Banner');
+                    if (settings.ads_interstitial_enabled) parts.push(`Tela Cheia a cada ${settings.ads_interstitial_interval}x`);
+                    badge.textContent = parts.length > 0 ? `ATIVOS (${parts.join(' + ')})` : 'ATIVOS (Sem formato)';
+                    badge.className = 'text-xs font-bold px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40';
+                }
+            }
+        }
+
+        async function saveAdsSettings() {
+            const saveBtn = document.getElementById('saveAdsBtn');
+            const feedback = document.getElementById('adsSaveFeedback');
+            const adsEnabled = document.getElementById('adsEnabledToggle').checked;
+            const adsBannerEnabled = document.getElementById('adsBannerToggle').checked;
+            const adsInterstitialEnabled = document.getElementById('adsInterstitialToggle').checked;
+            const rawInterval = parseInt(document.getElementById('adsIntervalInput').value || '4', 10);
+            const adsInterstitialInterval = Math.max(1, Math.min(50, isNaN(rawInterval) ? 4 : rawInterval));
+            document.getElementById('adsIntervalInput').value = adsInterstitialInterval;
+
+            saveBtn.disabled = true;
+            saveBtn.textContent = 'Salvando...';
+            if (feedback) feedback.classList.add('hidden');
+
+            try {
+                const res = await adminFetch('/admin/settings/ads', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        ads_enabled: adsEnabled,
+                        ads_banner_enabled: adsBannerEnabled,
+                        ads_interstitial_enabled: adsInterstitialEnabled,
+                        ads_interstitial_interval: adsInterstitialInterval
+                    })
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    renderAdsControl(data.ads_settings, true);
+                    if (feedback) {
+                        feedback.className = 'rounded-xl px-4 py-2.5 text-xs font-medium bg-emerald-500/15 border border-emerald-500/40 text-emerald-200';
+                        feedback.textContent = data.message || 'Configurações de anúncios salvas com sucesso!';
+                        feedback.classList.remove('hidden');
+                    }
+                } else {
+                    if (feedback) {
+                        feedback.className = 'rounded-xl px-4 py-2.5 text-xs font-medium bg-rose-500/15 border border-rose-500/40 text-rose-200';
+                        feedback.textContent = data.detail || 'Não foi possível salvar as configurações de anúncios.';
+                        feedback.classList.remove('hidden');
+                    }
+                }
+            } catch (e) {
+                if (feedback) {
+                    feedback.className = 'rounded-xl px-4 py-2.5 text-xs font-medium bg-rose-500/15 border border-rose-500/40 text-rose-200';
+                    feedback.textContent = 'Erro de conexão ao salvar configurações de anúncios.';
+                    feedback.classList.remove('hidden');
+                }
+            } finally {
+                saveBtn.disabled = false;
+                saveBtn.textContent = 'Salvar Configuração de Anúncios';
+            }
+        }
+
         async function loadMetrics() {
             try {
                 const res = await adminFetch('/admin/metrics');
@@ -1331,6 +1726,9 @@ async def admin_dashboard(request: Request):
                 document.getElementById('pendingReports').textContent = data.pending_reports;
                 if (typeof data.auto_midnight_pause_enabled === 'boolean') {
                     renderAutoPauseControl(data.auto_midnight_pause_enabled);
+                }
+                if (data.ads_settings) {
+                    renderAdsControl(data.ads_settings, false);
                 }
             } catch(e) {
                 console.error("Erro ao carregar métricas", e);
@@ -1444,6 +1842,7 @@ async def admin_dashboard(request: Request):
                 if (!res.ok) return;
                 loadUsers();
                 loadMetrics();
+                loadPushSummary();
             } catch (e) {
                 console.error(e);
             }
@@ -1455,13 +1854,154 @@ async def admin_dashboard(request: Request):
                 if (!res.ok) return;
                 loadUsers();
                 loadMetrics();
+                loadPushSummary();
             } catch (e) {
                 console.error(e);
             }
         }
 
+        function scrollToReportsSection() {
+            const section = document.getElementById('reportsSection');
+            if (section) {
+                section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+        }
+
+        function showReportsFeedback(isOk, message) {
+            const box = document.getElementById('reportsFeedback');
+            if (!box) return;
+            box.className = isOk
+                ? 'rounded-xl px-4 py-2.5 text-xs font-medium bg-emerald-500/15 border border-emerald-500/40 text-emerald-200'
+                : 'rounded-xl px-4 py-2.5 text-xs font-medium bg-rose-500/15 border border-rose-500/40 text-rose-200';
+            box.textContent = message;
+            box.classList.remove('hidden');
+        }
+
+        async function loadReports() {
+            const tbody = document.getElementById('reportsTableBody');
+            const filterEl = document.getElementById('reportsStatusFilter');
+            const badgeEl = document.getElementById('reportsSectionBadge');
+            const status = filterEl ? filterEl.value : 'pending';
+            try {
+                const res = await adminFetch(`/admin/reports?status=${encodeURIComponent(status)}`);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const rows = await res.json();
+                const pendingCount = rows.filter(r => r.status === 'pending').length;
+                if (badgeEl) {
+                    if (status === 'pending') {
+                        badgeEl.textContent = `${rows.length} pendente(s)`;
+                    } else {
+                        badgeEl.textContent = `${rows.length} registro(s) • ${pendingCount} pendente(s)`;
+                    }
+                }
+                if (!rows.length) {
+                    const emptyText = status === 'pending'
+                        ? 'Nenhuma denúncia pendente no momento.'
+                        : 'Nenhuma denúncia encontrada neste filtro.';
+                    tbody.innerHTML = `<tr><td colspan="5" class="text-center py-6 text-slate-500">${emptyText}</td></tr>`;
+                    return;
+                }
+                tbody.innerHTML = rows.map(r => {
+                    const dt = r.created_at ? new Date(r.created_at + 'Z').toLocaleString('pt-BR') : '--';
+                    const statusBadge = r.status === 'pending'
+                        ? '<span class="inline-block px-2 py-0.5 rounded-full text-[11px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40">Pendente</span>'
+                        : r.status === 'dismissed'
+                            ? '<span class="inline-block px-2 py-0.5 rounded-full text-[11px] font-semibold bg-slate-700 text-slate-300">Descartada</span>'
+                            : '<span class="inline-block px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">Resolvida</span>';
+                    const userStateBadge = !r.reported_is_active
+                        ? '<span class="text-[10px] px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300">Bloqueado</span>'
+                        : r.reported_is_paused
+                            ? '<span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300">Pausado</span>'
+                            : '<span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300">Ativo</span>';
+                    const actionsHtml = r.status === 'pending'
+                        ? `
+                            <button onclick="resolveReport(${r.id}, 'ban')" class="text-[11px] px-2.5 py-1 rounded-lg bg-rose-600/90 hover:bg-rose-500 text-white font-semibold transition">Bloquear</button>
+                            <button onclick="resolveReport(${r.id}, 'pause')" class="text-[11px] px-2.5 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 font-semibold transition">Pausar</button>
+                            <button onclick="resolveReport(${r.id}, 'resolve')" class="text-[11px] px-2.5 py-1 rounded-lg bg-emerald-600/90 hover:bg-emerald-500 text-white font-semibold transition">Resolver</button>
+                            <button onclick="resolveReport(${r.id}, 'dismiss')" class="text-[11px] px-2.5 py-1 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 transition">Descartar</button>
+                          `
+                        : `
+                            <button onclick="resolveReport(${r.id}, 'reopen')" class="text-[11px] px-2.5 py-1 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 transition">Reabrir</button>
+                            <button onclick="deleteReport(${r.id})" class="text-[11px] px-2.5 py-1 rounded-lg bg-rose-900/50 hover:bg-rose-900 text-rose-300 transition">Excluir</button>
+                          `;
+                    return `
+                        <tr class="hover:bg-slate-700/30 transition ${r.status === 'pending' ? 'bg-amber-500/5' : ''}">
+                            <td class="py-3 px-3 whitespace-nowrap space-y-1">
+                                <div>${statusBadge}</div>
+                                <div class="text-[11px] text-slate-400">${escapeHtml(dt)}</div>
+                            </td>
+                            <td class="py-3 px-3">
+                                <div class="flex items-center gap-1.5 font-semibold text-white">
+                                    <span>${escapeHtml(r.reported_name)}</span>
+                                    ${userStateBadge}
+                                </div>
+                                <div class="text-[11px] font-mono text-emerald-400">${escapeHtml(r.reported_phone || 'Sem telefone')}</div>
+                            </td>
+                            <td class="py-3 px-3 max-w-sm">
+                                <div class="font-semibold text-amber-200">${escapeHtml(r.reason)}</div>
+                                <div class="text-slate-400 whitespace-pre-wrap break-words mt-0.5">${escapeHtml(r.details || 'Sem detalhes adicionais.')}</div>
+                            </td>
+                            <td class="py-3 px-3 whitespace-nowrap">
+                                <div class="text-slate-200 font-medium">${escapeHtml(r.reporter_name)}</div>
+                                <div class="text-[11px] font-mono text-slate-400">${escapeHtml(r.reporter_phone || '')}</div>
+                            </td>
+                            <td class="py-3 px-3 text-right space-x-1 whitespace-nowrap">
+                                ${actionsHtml}
+                            </td>
+                        </tr>
+                    `;
+                }).join('');
+            } catch (e) {
+                tbody.innerHTML = '<tr><td colspan="5" class="text-center py-6 text-rose-400">Erro ao carregar denúncias.</td></tr>';
+            }
+        }
+
+        async function resolveReport(reportId, action) {
+            if (action === 'ban' && !confirm('Tem certeza que deseja BLOQUEAR este usuário denunciado e encerrar a denúncia?')) {
+                return;
+            }
+            try {
+                const res = await adminFetch(`/admin/reports/${reportId}/resolve?action=${encodeURIComponent(action)}`, {
+                    method: 'POST'
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    showReportsFeedback(false, data.detail || 'Não foi possível processar a denúncia.');
+                    return;
+                }
+                showReportsFeedback(true, data.message || 'Denúncia atualizada com sucesso.');
+                loadReports();
+                loadMetrics();
+                loadUsers();
+            } catch (e) {
+                showReportsFeedback(false, 'Erro de conexão ao processar denúncia.');
+            }
+        }
+
+        async function deleteReport(reportId) {
+            if (!confirm('Deseja excluir permanentemente este registro de denúncia?')) {
+                return;
+            }
+            try {
+                const res = await adminFetch(`/admin/reports/${reportId}`, {
+                    method: 'DELETE'
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    showReportsFeedback(false, data.detail || 'Não foi possível excluir a denúncia.');
+                    return;
+                }
+                showReportsFeedback(true, data.message || 'Denúncia excluída.');
+                loadReports();
+                loadMetrics();
+            } catch (e) {
+                showReportsFeedback(false, 'Erro de conexão ao excluir denúncia.');
+            }
+        }
+
         // Init (painel já autenticado via cookie HttpOnly + CSRF)
         loadMetrics();
+        loadReports();
         loadUsers();
         loadPushSummary();
         loadPushHistory();
