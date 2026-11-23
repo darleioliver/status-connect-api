@@ -2182,7 +2182,7 @@ async def admin_dashboard(request: Request):
         }
 
         async function bulkPauseAllUsers() {
-            if (!confirm('Tem certeza que deseja PAUSAR TODOS os usuários ativos da rede agora?\n\nUsuários bloqueados não serão alterados.')) {
+            if (!confirm('Tem certeza que deseja PAUSAR TODOS os usuários ativos da rede agora?\\n\\nUsuários bloqueados não serão alterados.')) {
                 return;
             }
             const pauseBtn = document.getElementById('btnBulkPauseAll');
@@ -2213,7 +2213,7 @@ async def admin_dashboard(request: Request):
         }
 
         async function bulkActivateAllUsers() {
-            if (!confirm('Tem certeza que deseja ATIVAR TODOS os usuários pausados da rede agora?\n\nUsuários bloqueados continuam bloqueados.')) {
+            if (!confirm('Tem certeza que deseja ATIVAR TODOS os usuários pausados da rede agora?\\n\\nUsuários bloqueados continuam bloqueados.')) {
                 return;
             }
             const pauseBtn = document.getElementById('btnBulkPauseAll');

@@ -161,36 +161,37 @@ async def revoke_expired_premium_users(db: AsyncSession) -> int:
     now = datetime.datetime.utcnow()
     today_str = brasilia_today_str()
     try:
-        expired_stmt = select(User.id, User.name).where(
-            User.is_premium == True,
-            User.premium_expires_at != None,
-            User.premium_expires_at <= now,
-        )
-        expired_rows = (await db.execute(expired_stmt)).all()
-        if not expired_rows:
-            return 0
-
-        expired_ids = [row[0] for row in expired_rows]
-        from sqlalchemy import update
-        await db.execute(
-            update(User)
-            .where(User.id.in_(expired_ids))
-            .values(
-                is_premium=False,
-                premium_expires_at=None,
-                last_active_date=today_str,
-                updated_at=now,
+        async with db.begin_nested():
+            expired_stmt = select(User.id, User.name).where(
+                User.is_premium == True,
+                User.premium_expires_at != None,
+                User.premium_expires_at <= now,
             )
-        )
-        for uid, uname in expired_rows:
-            db.add(
-                AuditLog(
-                    user_id=uid,
-                    action="PREMIUM_EXPIRED",
-                    timestamp=now,
-                    details=f"Plano Premium de {uname} expirou automaticamente e voltou para o plano Grátis.",
+            expired_rows = (await db.execute(expired_stmt)).all()
+            if not expired_rows:
+                return 0
+
+            expired_ids = [row[0] for row in expired_rows]
+            from sqlalchemy import update
+            await db.execute(
+                update(User)
+                .where(User.id.in_(expired_ids))
+                .values(
+                    is_premium=False,
+                    premium_expires_at=None,
+                    last_active_date=today_str,
+                    updated_at=now,
                 )
             )
+            for uid, uname in expired_rows:
+                db.add(
+                    AuditLog(
+                        user_id=uid,
+                        action="PREMIUM_EXPIRED",
+                        timestamp=now,
+                        details=f"Plano Premium de {uname} expirou automaticamente e voltou para o plano Grátis.",
+                    )
+                )
         await db.commit()
         return len(expired_ids)
     except Exception:
