@@ -1,15 +1,16 @@
+import base64
 import datetime
 import hashlib
 from contextlib import asynccontextmanager
 from typing import List
-from fastapi import FastAPI, Depends, HTTPException, Query, status
+from fastapi import FastAPI, Depends, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, func, and_, update, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import engine, get_db
 from db_migrations import ensure_push_tables, ensure_push_tables_and_schema
-from models import User, ContactExchange, OtpVerification, Report, AuditLog, DeviceToken, PushCampaign
+from models import User, ContactExchange, OtpVerification, Report, AuditLog, DeviceToken, PushCampaign, HomeBanner
 from schemas import (
     OtpRequest, OtpVerifyRequest, LoginRequest, UserRegisterRequest, UserResponse,
     ContactDto, ExchangeRequest, ExchangeBatchResponse, StatsResponse,
@@ -18,7 +19,7 @@ from schemas import (
 from exchange_service import (
     generate_and_store_otp, verify_otp, get_reciprocal_contacts_batch,
     seed_initial_community_pool, pause_expired_free_users, brasilia_today_str,
-    is_midnight_auto_pause_enabled, get_ads_settings
+    is_midnight_auto_pause_enabled, get_ads_settings, is_home_carousel_enabled
 )
 from push_service import register_device_token
 from admin import router as admin_router
@@ -98,6 +99,65 @@ async def get_network_summary(db: AsyncSession = Depends(get_db)):
 @app.get("/api/v1/ads/config", tags=["Sistema"])
 async def get_public_ads_config(db: AsyncSession = Depends(get_db)):
     return await get_ads_settings(db)
+
+
+@app.get("/api/v1/banners/home", tags=["Sistema"])
+async def get_public_home_banners(db: AsyncSession = Depends(get_db)):
+    await ensure_push_tables()
+    enabled = await is_home_carousel_enabled(db)
+    if not enabled:
+        return {"enabled": False, "auto_scroll_seconds": 5, "banners": []}
+
+    stmt = (
+        select(HomeBanner)
+        .where(HomeBanner.is_active == True)
+        .order_by(HomeBanner.sort_order.asc(), HomeBanner.id.asc())
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    items = []
+    for b in rows:
+        updated_ts = int((b.updated_at or b.created_at or datetime.datetime.utcnow()).timestamp())
+        if b.image_base64:
+            resolved_url = f"/api/v1/banners/{b.id}/image?v={updated_ts}"
+        else:
+            resolved_url = (b.image_url or "").strip()
+        if not resolved_url:
+            continue
+        items.append(
+            {
+                "id": b.id,
+                "title": b.title or "",
+                "image_url": resolved_url,
+                "link_url": (b.link_url or "").strip(),
+                "sort_order": int(b.sort_order or 0),
+                "updated_at": (b.updated_at or b.created_at).isoformat() if (b.updated_at or b.created_at) else None,
+            }
+        )
+    return {
+        "enabled": True,
+        "auto_scroll_seconds": 5,
+        "banners": items,
+    }
+
+
+@app.get("/api/v1/banners/{banner_id}/image", tags=["Sistema"])
+async def get_home_banner_image(banner_id: int, db: AsyncSession = Depends(get_db)):
+    await ensure_push_tables()
+    banner = await db.get(HomeBanner, banner_id)
+    if not banner or not banner.image_base64:
+        raise HTTPException(status_code=404, detail="Imagem do banner não encontrada.")
+    try:
+        raw_bytes = base64.b64decode(banner.image_base64)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Imagem do banner inválida.")
+    mime = banner.image_mime if banner.image_mime in {"image/jpeg", "image/png", "image/webp"} else "image/jpeg"
+    return Response(
+        content=raw_bytes,
+        media_type=mime,
+        headers={
+            "Cache-Control": "public, max-age=86400",
+        },
+    )
 
 @app.get("/api/v1/network/public-contacts", response_model=List[ContactDto], tags=["Rede"])
 async def get_public_network_contacts(

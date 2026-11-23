@@ -144,3 +144,19 @@ class AppSetting(Base):
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
 
+class HomeBanner(Base):
+    __tablename__ = "home_banners"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    title = Column(String(120), default="", nullable=False)
+    link_url = Column(String(500), default="", nullable=False)
+    image_url = Column(String(1000), default="", nullable=False)
+    image_base64 = Column(Text, default="", nullable=True)
+    image_mime = Column(String(50), default="image/jpeg", nullable=False)
+    sort_order = Column(Integer, default=0, index=True, nullable=False)
+    is_active = Column(Boolean, default=True, index=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+
+
+

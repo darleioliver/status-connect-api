@@ -13,6 +13,7 @@ SETTING_ADS_ENABLED = "ads_enabled"
 SETTING_ADS_BANNER_ENABLED = "ads_banner_enabled"
 SETTING_ADS_INTERSTITIAL_ENABLED = "ads_interstitial_enabled"
 SETTING_ADS_INTERSTITIAL_INTERVAL = "ads_interstitial_interval"
+SETTING_HOME_CAROUSEL_ENABLED = "home_carousel_enabled"
 DEFAULT_INTERSTITIAL_INTERVAL = 4
 MIN_INTERSTITIAL_INTERVAL = 1
 MAX_INTERSTITIAL_INTERVAL = 50
@@ -153,6 +154,40 @@ async def update_ads_settings(
         "ads_interstitial_enabled": bool(ads_interstitial_enabled),
         "ads_interstitial_interval": clamped_interval,
     }
+
+
+async def is_home_carousel_enabled(db: AsyncSession) -> bool:
+    """Retorna se o banner carrossel no topo da tela inicial está ativado (padrão: True)."""
+    await ensure_push_tables()
+    try:
+        async with db.begin_nested():
+            setting = await db.get(AppSetting, SETTING_HOME_CAROUSEL_ENABLED)
+            if not setting:
+                return True
+            return _parse_bool_setting(setting.value, True)
+    except Exception:
+        return True
+
+
+async def set_home_carousel_enabled(db: AsyncSession, enabled: bool) -> bool:
+    """Ativa ou desativa globalmente o banner carrossel da tela inicial pelo painel admin."""
+    await ensure_push_tables()
+    now = datetime.datetime.utcnow()
+    await _upsert_app_setting(db, SETTING_HOME_CAROUSEL_ENABLED, "true" if enabled else "false", now)
+    db.add(
+        AuditLog(
+            user_id=None,
+            action="HOME_CAROUSEL_ENABLED" if enabled else "HOME_CAROUSEL_DISABLED",
+            timestamp=now,
+            details=(
+                "Administrador ATIVOU o banner carrossel da tela inicial."
+                if enabled
+                else "Administrador DESATIVOU o banner carrossel da tela inicial."
+            ),
+        )
+    )
+    await db.commit()
+    return bool(enabled)
 
 
 async def revoke_expired_premium_users(db: AsyncSession) -> int:

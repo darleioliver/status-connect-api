@@ -83,6 +83,21 @@ _POSTGRES_PUSH_STATEMENTS: List[str] = [
         updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS home_banners (
+        id SERIAL PRIMARY KEY,
+        title VARCHAR(120) NOT NULL DEFAULT '',
+        link_url VARCHAR(500) NOT NULL DEFAULT '',
+        image_url VARCHAR(1000) NOT NULL DEFAULT '',
+        image_base64 TEXT NULL,
+        image_mime VARCHAR(50) NOT NULL DEFAULT 'image/jpeg',
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_home_banners_active_order ON home_banners (is_active, sort_order, id)",
 ]
 
 

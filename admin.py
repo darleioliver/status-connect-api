@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
 from db_migrations import ensure_push_tables
-from models import User, ContactExchange, Report, AuditLog, DeviceToken, PushCampaign
+from models import User, ContactExchange, Report, AuditLog, DeviceToken, PushCampaign, HomeBanner
 from schemas import PushSendRequest
 from exchange_service import (
     brasilia_today_str,
@@ -26,6 +26,8 @@ from exchange_service import (
     set_midnight_auto_pause_enabled,
     get_ads_settings,
     update_ads_settings,
+    is_home_carousel_enabled,
+    set_home_carousel_enabled,
 )
 from push_service import ensure_firebase_initialized, get_audience_counts, send_push_campaign
 
@@ -71,6 +73,19 @@ class AdsSettingsUpdateRequest(BaseModel):
     ads_banner_enabled: bool = True
     ads_interstitial_enabled: bool = True
     ads_interstitial_interval: int = Field(default=4, ge=1, le=50)
+
+
+class HomeCarouselToggleRequest(BaseModel):
+    enabled: Optional[bool] = None
+
+
+class HomeBannerSaveRequest(BaseModel):
+    title: str = Field(default="", max_length=120)
+    link_url: str = Field(default="", max_length=500)
+    image_url: Optional[str] = Field(default=None, max_length=1000)
+    image_data_url: Optional[str] = Field(default=None)
+    sort_order: int = Field(default=0, ge=0, le=999)
+    is_active: bool = True
 
 
 def _get_configured_admin_secret() -> str:
@@ -544,6 +559,236 @@ async def save_admin_ads_settings(
             else "Configuração de anúncios AdMob atualizada com sucesso."
         ),
     }
+
+
+_ALLOWED_BANNER_MIMES = {"image/jpeg", "image/png", "image/webp"}
+_MAX_BANNER_IMAGE_BYTES = 2 * 1024 * 1024  # 2 MB após otimização no navegador
+
+
+def _normalize_banner_link(raw_link: Optional[str]) -> str:
+    val = (raw_link or "").strip()
+    if not val:
+        return ""
+    if val.lower() in {"plans", "premium", "planos"}:
+        return "plans"
+    parsed = urlparse(val)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return val
+    raise HTTPException(
+        status_code=400,
+        detail="Link inválido. Use uma URL iniciando com https://, escreva 'plans' (Planos Premium) ou deixe em branco.",
+    )
+
+
+def _normalize_external_image_url(raw_url: Optional[str]) -> str:
+    val = (raw_url or "").strip()
+    if not val:
+        return ""
+    parsed = urlparse(val)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return val
+    raise HTTPException(
+        status_code=400,
+        detail="URL de imagem inválida. Informe uma URL iniciando com https:// ou envie uma foto do seu dispositivo.",
+    )
+
+
+def _parse_banner_data_url(data_url: str) -> Tuple[str, str]:
+    raw = (data_url or "").strip()
+    if not raw.startswith("data:") or ";base64," not in raw:
+        raise HTTPException(status_code=400, detail="Formato de imagem inválido. Envie JPG, PNG ou WebP.")
+    header, b64_payload = raw.split(";base64,", 1)
+    mime = header[5:].strip().lower()
+    if mime == "image/jpg":
+        mime = "image/jpeg"
+    if mime not in _ALLOWED_BANNER_MIMES:
+        raise HTTPException(status_code=400, detail="Tipo de imagem não suportado. Use JPG, PNG ou WebP.")
+    try:
+        decoded = base64.b64decode(b64_payload, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Dados da imagem corrompidos. Tente enviar a foto novamente.")
+    if len(decoded) == 0:
+        raise HTTPException(status_code=400, detail="Arquivo de imagem vazio.")
+    if len(decoded) > _MAX_BANNER_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail="Imagem muito grande (máximo 2 MB). Reduza a resolução para 1200x450 px.")
+    clean_b64 = base64.b64encode(decoded).decode("ascii")
+    return mime, clean_b64
+
+
+def _serialize_admin_banner(b: HomeBanner) -> Dict[str, object]:
+    ts = int((b.updated_at or b.created_at or datetime.datetime.utcnow()).timestamp())
+    has_upload = bool(b.image_base64)
+    preview_url = f"/api/v1/banners/{b.id}/image?v={ts}" if has_upload else (b.image_url or "")
+    return {
+        "id": b.id,
+        "title": b.title or "",
+        "link_url": b.link_url or "",
+        "image_url": b.image_url or "",
+        "preview_url": preview_url,
+        "has_uploaded_image": has_upload,
+        "sort_order": int(b.sort_order or 0),
+        "is_active": bool(b.is_active),
+        "updated_at": (b.updated_at or b.created_at).isoformat() if (b.updated_at or b.created_at) else None,
+    }
+
+
+@router.get("/banners", dependencies=[Depends(require_admin_read)])
+async def list_admin_home_banners(db: AsyncSession = Depends(get_db)):
+    await ensure_push_tables()
+    enabled = await is_home_carousel_enabled(db)
+    stmt = select(HomeBanner).order_by(HomeBanner.sort_order.asc(), HomeBanner.id.asc())
+    rows = (await db.execute(stmt)).scalars().all()
+    return {
+        "enabled": enabled,
+        "banners": [_serialize_admin_banner(b) for b in rows],
+    }
+
+
+@router.post("/banners/toggle-global", dependencies=[Depends(require_admin_write)])
+async def toggle_global_home_carousel(
+    payload: Optional[HomeCarouselToggleRequest] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    current = await is_home_carousel_enabled(db)
+    target = (not current) if (payload is None or payload.enabled is None) else bool(payload.enabled)
+    await set_home_carousel_enabled(db, target)
+    return {
+        "success": True,
+        "enabled": target,
+        "message": (
+            "Banner carrossel da Tela Inicial ATIVADO! Os slides ativos já aparecem no topo do app."
+            if target
+            else "Banner carrossel da Tela Inicial DESATIVADO. Nenhum slide será exibido no app."
+        ),
+    }
+
+
+@router.post("/banners", dependencies=[Depends(require_admin_write)])
+async def create_admin_home_banner(
+    payload: HomeBannerSaveRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    await ensure_push_tables()
+    link_url = _normalize_banner_link(payload.link_url)
+    mime = "image/jpeg"
+    b64_data = ""
+    ext_url = ""
+
+    if payload.image_data_url and payload.image_data_url.strip():
+        mime, b64_data = _parse_banner_data_url(payload.image_data_url)
+    elif payload.image_url and payload.image_url.strip():
+        ext_url = _normalize_external_image_url(payload.image_url)
+    else:
+        raise HTTPException(status_code=400, detail="Envie uma foto do seu dispositivo ou informe a URL da imagem.")
+
+    now = datetime.datetime.utcnow()
+    banner = HomeBanner(
+        title=(payload.title or "").strip()[:120],
+        link_url=link_url,
+        image_url=ext_url,
+        image_base64=b64_data or None,
+        image_mime=mime,
+        sort_order=int(payload.sort_order or 0),
+        is_active=bool(payload.is_active),
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(banner)
+    await db.flush()
+    db.add(
+        AuditLog(
+            user_id=None,
+            action="HOME_BANNER_CREATED",
+            timestamp=now,
+            details=f"Banner carrossel #{banner.id} criado ({banner.title or 'sem título'}).",
+        )
+    )
+    await db.commit()
+    await db.refresh(banner)
+    return {
+        "success": True,
+        "banner": _serialize_admin_banner(banner),
+        "message": f"Slide #{banner.id} adicionado ao carrossel com sucesso!",
+    }
+
+
+@router.post("/banners/{banner_id}/update", dependencies=[Depends(require_admin_write)])
+async def update_admin_home_banner(
+    banner_id: int,
+    payload: HomeBannerSaveRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    await ensure_push_tables()
+    banner = await db.get(HomeBanner, banner_id)
+    if not banner:
+        raise HTTPException(status_code=404, detail="Banner não encontrado.")
+
+    banner.title = (payload.title or "").strip()[:120]
+    banner.link_url = _normalize_banner_link(payload.link_url)
+    banner.sort_order = int(payload.sort_order or 0)
+    banner.is_active = bool(payload.is_active)
+
+    if payload.image_data_url and payload.image_data_url.strip():
+        mime, b64_data = _parse_banner_data_url(payload.image_data_url)
+        banner.image_mime = mime
+        banner.image_base64 = b64_data
+        banner.image_url = ""
+    elif payload.image_url and payload.image_url.strip():
+        banner.image_url = _normalize_external_image_url(payload.image_url)
+        banner.image_base64 = None
+
+    now = datetime.datetime.utcnow()
+    banner.updated_at = now
+    db.add(
+        AuditLog(
+            user_id=None,
+            action="HOME_BANNER_UPDATED",
+            timestamp=now,
+            details=f"Banner carrossel #{banner.id} atualizado ({banner.title or 'sem título'}).",
+        )
+    )
+    await db.commit()
+    await db.refresh(banner)
+    return {
+        "success": True,
+        "banner": _serialize_admin_banner(banner),
+        "message": f"Slide #{banner.id} atualizado com sucesso!",
+    }
+
+
+@router.post("/banners/{banner_id}/toggle", dependencies=[Depends(require_admin_write)])
+async def toggle_admin_home_banner(banner_id: int, db: AsyncSession = Depends(get_db)):
+    await ensure_push_tables()
+    banner = await db.get(HomeBanner, banner_id)
+    if not banner:
+        raise HTTPException(status_code=404, detail="Banner não encontrado.")
+    banner.is_active = not bool(banner.is_active)
+    banner.updated_at = datetime.datetime.utcnow()
+    await db.commit()
+    return {
+        "success": True,
+        "is_active": banner.is_active,
+        "message": f"Slide #{banner.id} {'ativado' if banner.is_active else 'pausado'} com sucesso.",
+    }
+
+
+@router.delete("/banners/{banner_id}", dependencies=[Depends(require_admin_write)])
+async def delete_admin_home_banner(banner_id: int, db: AsyncSession = Depends(get_db)):
+    await ensure_push_tables()
+    banner = await db.get(HomeBanner, banner_id)
+    if not banner:
+        raise HTTPException(status_code=404, detail="Banner não encontrado.")
+    await db.delete(banner)
+    db.add(
+        AuditLog(
+            user_id=None,
+            action="HOME_BANNER_DELETED",
+            timestamp=datetime.datetime.utcnow(),
+            details=f"Banner carrossel #{banner_id} removido.",
+        )
+    )
+    await db.commit()
+    return {"success": True, "message": f"Slide #{banner_id} excluído com sucesso."}
 
 @router.get("/users", dependencies=[Depends(require_admin_read)])
 async def list_admin_users(
@@ -1224,6 +1469,115 @@ async def admin_dashboard(request: Request):
                 </div>
             </div>
             <div id="adsSaveFeedback" class="hidden rounded-xl px-4 py-2.5 text-xs font-medium"></div>
+        </section>
+
+        <!-- Controle Global: Banner Carrossel da Tela Inicial -->
+        <section class="bg-slate-800/80 border border-violet-700/40 rounded-2xl p-6 shadow-sm space-y-5">
+            <div class="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-slate-700/70 pb-4">
+                <div>
+                    <div class="flex flex-wrap items-center gap-2.5">
+                        <h2 class="text-base font-semibold text-white">Banner Carrossel da Tela Inicial (Topo do App)</h2>
+                        <span id="carouselGlobalBadge" class="text-xs font-bold px-2.5 py-0.5 rounded-full bg-slate-700 text-slate-300 border border-slate-600">
+                            Carregando...
+                        </span>
+                    </div>
+                    <p class="text-xs text-slate-400 mt-1">
+                        Adicione, substitua fotos, pause ou desative totalmente os banners deslizantes do topo da Tela Inicial.
+                        <span class="text-violet-300 font-semibold">Tamanho recomendado: 1200 × 450 px (proporção 8:3, JPG ou PNG).</span>
+                    </p>
+                </div>
+                <button id="carouselGlobalToggleBtn" onclick="toggleGlobalHomeCarousel()" disabled
+                        class="px-5 py-2.5 rounded-xl font-semibold text-sm bg-slate-700 text-slate-200 transition whitespace-nowrap">
+                    Carregando...
+                </button>
+            </div>
+
+            <div class="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+                <!-- Formulário Adicionar / Substituir Slide -->
+                <div class="lg:col-span-5 bg-slate-900/70 border border-slate-700/70 rounded-2xl p-4 space-y-3.5">
+                    <div class="flex items-center justify-between gap-2">
+                        <h3 id="bannerFormTitle" class="text-sm font-semibold text-white">Adicionar Novo Slide</h3>
+                        <button id="bannerCancelEditBtn" type="button" onclick="resetHomeBannerForm()" class="hidden text-xs text-slate-400 hover:text-white underline">
+                            Cancelar edição
+                        </button>
+                    </div>
+                    <input id="bannerEditId" type="hidden" value="">
+
+                    <div>
+                        <label for="bannerFileInput" class="block text-xs font-semibold text-slate-300 mb-1">
+                            Foto do Banner (envio direto do PC ou celular)
+                        </label>
+                        <input id="bannerFileInput" type="file" accept="image/png,image/jpeg,image/webp" onchange="handleBannerFileSelected(this)"
+                               class="w-full text-xs text-slate-300 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-violet-600 file:text-white hover:file:bg-violet-500 bg-slate-950 border border-slate-700 rounded-xl p-1.5 cursor-pointer">
+                        <p class="text-[11px] text-slate-400 mt-1">Otimizado automaticamente para 1200×450 px antes de salvar no banco.</p>
+                    </div>
+
+                    <div id="bannerPreviewWrap" class="hidden space-y-1">
+                        <p class="text-[11px] text-slate-400 font-semibold">Prévia (proporção 8:3 igual ao app):</p>
+                        <div class="w-full rounded-xl overflow-hidden border border-slate-700 bg-slate-950" style="aspect-ratio: 8 / 3;">
+                            <img id="bannerPreviewImg" src="" alt="Prévia do banner" class="w-full h-full object-cover">
+                        </div>
+                    </div>
+
+                    <div>
+                        <label for="bannerImageUrlInput" class="block text-xs font-semibold text-slate-300 mb-1">
+                            Ou URL da imagem (opcional)
+                        </label>
+                        <input id="bannerImageUrlInput" type="url" placeholder="https://exemplo.com/banner.jpg"
+                               class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:ring-2 focus:ring-violet-500">
+                    </div>
+
+                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                        <div class="sm:col-span-2">
+                            <label for="bannerTitleInput" class="block text-xs font-semibold text-slate-300 mb-1">Título (interno/alt)</label>
+                            <input id="bannerTitleInput" type="text" maxlength="120" placeholder="Ex.: Promoção Plano Premium"
+                                   class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:ring-2 focus:ring-violet-500">
+                        </div>
+                        <div>
+                            <label for="bannerOrderInput" class="block text-xs font-semibold text-slate-300 mb-1">Ordem</label>
+                            <input id="bannerOrderInput" type="number" min="0" max="999" value="0"
+                                   class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white text-center focus:outline-none focus:ring-2 focus:ring-violet-500">
+                        </div>
+                    </div>
+
+                    <div>
+                        <div class="flex items-center justify-between gap-2 mb-1">
+                            <label for="bannerLinkInput" class="block text-xs font-semibold text-slate-300">Link ao tocar no banner (opcional)</label>
+                            <button type="button" onclick="document.getElementById('bannerLinkInput').value='plans'" class="text-[11px] text-amber-300 hover:text-amber-200 underline">
+                                Usar tela ★ Premium
+                            </button>
+                        </div>
+                        <input id="bannerLinkInput" type="text" maxlength="500" placeholder="https://... ou escreva plans"
+                               class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:ring-2 focus:ring-violet-500">
+                    </div>
+
+                    <label class="flex items-center gap-2 text-xs text-slate-200 cursor-pointer">
+                        <input id="bannerActiveInput" type="checkbox" checked class="w-4 h-4 accent-violet-500 rounded">
+                        <span>Slide ativo imediatamente no aplicativo</span>
+                    </label>
+
+                    <button id="saveBannerBtn" type="button" onclick="saveHomeBanner()"
+                            class="w-full py-2.5 px-4 rounded-xl font-bold text-sm bg-violet-500 hover:bg-violet-400 text-slate-950 transition shadow-lg shadow-violet-500/15">
+                        Salvar Slide no Carrossel
+                    </button>
+                    <div id="bannerFeedbackBox" class="hidden rounded-xl px-3.5 py-2 text-xs font-medium"></div>
+                </div>
+
+                <!-- Lista de Slides Cadastrados -->
+                <div class="lg:col-span-7 space-y-3">
+                    <div class="flex items-center justify-between">
+                        <h3 class="text-sm font-semibold text-white">Slides Cadastrados (<span id="bannersCountLabel">0</span>)</h3>
+                        <button type="button" onclick="loadHomeBanners()" class="text-xs px-3 py-1 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 transition">
+                            Atualizar lista
+                        </button>
+                    </div>
+                    <div id="bannersListContainer" class="space-y-3">
+                        <div class="text-xs text-slate-400 bg-slate-900/50 border border-slate-700/60 rounded-xl p-4 text-center">
+                            Carregando banners...
+                        </div>
+                    </div>
+                </div>
+            </div>
         </section>
 
         <!-- Seção de Notificações Push (Firebase FCM) -->
@@ -2614,8 +2968,273 @@ async def admin_dashboard(request: Request):
             }
         }
 
+        // ================= Banner Carrossel da Tela Inicial =================
+        let cachedHomeBanners = [];
+        let homeCarouselGlobalEnabled = true;
+        let pendingBannerDataUrl = '';
+
+        function showBannerFeedback(isOk, msg) {
+            const box = document.getElementById('bannerFeedbackBox');
+            if (!box) return;
+            box.classList.remove('hidden', 'bg-emerald-950/60', 'border', 'border-emerald-600/50', 'text-emerald-200', 'bg-rose-950/60', 'border-rose-600/50', 'text-rose-200');
+            if (isOk) {
+                box.classList.add('bg-emerald-950/60', 'border', 'border-emerald-600/50', 'text-emerald-200');
+            } else {
+                box.classList.add('bg-rose-950/60', 'border', 'border-rose-600/50', 'text-rose-200');
+            }
+            box.textContent = msg;
+        }
+
+        function renderCarouselGlobalToggle(enabled) {
+            homeCarouselGlobalEnabled = Boolean(enabled);
+            const badge = document.getElementById('carouselGlobalBadge');
+            const btn = document.getElementById('carouselGlobalToggleBtn');
+            if (!badge || !btn) return;
+            btn.disabled = false;
+            if (homeCarouselGlobalEnabled) {
+                badge.textContent = 'ATIVADO';
+                badge.className = 'text-xs font-bold px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40';
+                btn.textContent = 'Desativar Carrossel';
+                btn.className = 'px-5 py-2.5 rounded-xl font-semibold text-sm bg-rose-600 hover:bg-rose-500 text-white transition whitespace-nowrap';
+            } else {
+                badge.textContent = 'DESATIVADO';
+                badge.className = 'text-xs font-bold px-2.5 py-0.5 rounded-full bg-rose-500/20 text-rose-300 border border-rose-500/40';
+                btn.textContent = 'Ativar Carrossel';
+                btn.className = 'px-5 py-2.5 rounded-xl font-semibold text-sm bg-emerald-500 hover:bg-emerald-400 text-slate-950 transition whitespace-nowrap';
+            }
+        }
+
+        function handleBannerFileSelected(input) {
+            const file = input && input.files ? input.files[0] : null;
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = function(ev) {
+                const img = new Image();
+                img.onload = function() {
+                    const maxW = 1200;
+                    const maxH = 600;
+                    let w = img.naturalWidth || img.width;
+                    let h = img.naturalHeight || img.height;
+                    const ratio = Math.min(1, maxW / w, maxH / h);
+                    w = Math.max(1, Math.round(w * ratio));
+                    h = Math.max(1, Math.round(h * ratio));
+                    const canvas = document.createElement('canvas');
+                    canvas.width = w;
+                    canvas.height = h;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0, w, h);
+                    const mime = (file.type === 'image/png' || file.type === 'image/webp') ? 'image/webp' : 'image/jpeg';
+                    let dataUrl = canvas.toDataURL(mime, 0.86);
+                    if (!dataUrl.startsWith('data:image/')) {
+                        dataUrl = canvas.toDataURL('image/jpeg', 0.86);
+                    }
+                    pendingBannerDataUrl = dataUrl;
+                    const prevWrap = document.getElementById('bannerPreviewWrap');
+                    const prevImg = document.getElementById('bannerPreviewImg');
+                    if (prevImg && prevWrap) {
+                        prevImg.src = dataUrl;
+                        prevWrap.classList.remove('hidden');
+                    }
+                };
+                img.src = ev.target.result;
+            };
+            reader.readAsDataURL(file);
+        }
+
+        function resetHomeBannerForm() {
+            pendingBannerDataUrl = '';
+            document.getElementById('bannerEditId').value = '';
+            document.getElementById('bannerFormTitle').textContent = 'Adicionar Novo Slide';
+            document.getElementById('saveBannerBtn').textContent = 'Salvar Slide no Carrossel';
+            document.getElementById('bannerCancelEditBtn').classList.add('hidden');
+            document.getElementById('bannerFileInput').value = '';
+            document.getElementById('bannerImageUrlInput').value = '';
+            document.getElementById('bannerTitleInput').value = '';
+            document.getElementById('bannerLinkInput').value = '';
+            document.getElementById('bannerOrderInput').value = String(cachedHomeBanners.length);
+            document.getElementById('bannerActiveInput').checked = true;
+            document.getElementById('bannerPreviewWrap').classList.add('hidden');
+            document.getElementById('bannerPreviewImg').src = '';
+        }
+
+        function editHomeBanner(bannerId) {
+            const b = cachedHomeBanners.find(item => item.id === bannerId);
+            if (!b) return;
+            pendingBannerDataUrl = '';
+            document.getElementById('bannerEditId').value = String(b.id);
+            document.getElementById('bannerFormTitle').textContent = `Editando / Substituir Foto — Slide #${b.id}`;
+            document.getElementById('saveBannerBtn').textContent = `Atualizar Slide #${b.id}`;
+            document.getElementById('bannerCancelEditBtn').classList.remove('hidden');
+            document.getElementById('bannerFileInput').value = '';
+            document.getElementById('bannerImageUrlInput').value = b.has_uploaded_image ? '' : (b.image_url || '');
+            document.getElementById('bannerTitleInput').value = b.title || '';
+            document.getElementById('bannerLinkInput').value = b.link_url || '';
+            document.getElementById('bannerOrderInput').value = String(b.sort_order ?? 0);
+            document.getElementById('bannerActiveInput').checked = Boolean(b.is_active);
+            const prevWrap = document.getElementById('bannerPreviewWrap');
+            const prevImg = document.getElementById('bannerPreviewImg');
+            if (b.preview_url && prevWrap && prevImg) {
+                prevImg.src = b.preview_url;
+                prevWrap.classList.remove('hidden');
+            }
+            document.getElementById('bannerFormTitle').scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+
+        async function loadHomeBanners() {
+            const container = document.getElementById('bannersListContainer');
+            const countLabel = document.getElementById('bannersCountLabel');
+            if (!container) return;
+            try {
+                const res = await adminFetch('/admin/banners');
+                const data = await res.json();
+                renderCarouselGlobalToggle(data.enabled);
+                cachedHomeBanners = Array.isArray(data.banners) ? data.banners : [];
+                if (countLabel) countLabel.textContent = String(cachedHomeBanners.length);
+
+                if (cachedHomeBanners.length === 0) {
+                    container.innerHTML = '<div class="text-xs text-slate-400 bg-slate-900/50 border border-dashed border-slate-700 rounded-xl p-6 text-center">Nenhum banner cadastrado ainda. Envie uma imagem 1200×450 px ao lado para ativar o carrossel no topo do app.</div>';
+                    return;
+                }
+
+                container.innerHTML = cachedHomeBanners.map(b => {
+                    const statusBadge = b.is_active
+                        ? '<span class="px-2 py-0.5 rounded-full text-[11px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">Ativo</span>'
+                        : '<span class="px-2 py-0.5 rounded-full text-[11px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40">Pausado</span>';
+                    const linkLabel = !b.link_url
+                        ? 'Sem link (apenas visual)'
+                        : (b.link_url === 'plans' ? 'Abre tela ★ Planos Premium' : b.link_url);
+                    return `
+                        <div class="bg-slate-900/75 border border-slate-700/80 rounded-xl p-3 flex flex-col sm:flex-row gap-3 items-start sm:items-center">
+                            <div class="w-full sm:w-44 rounded-lg overflow-hidden border border-slate-700 bg-slate-950 shrink-0" style="aspect-ratio: 8 / 3;">
+                                <img src="${escapeHtml(b.preview_url)}" alt="${escapeHtml(b.title || 'Banner')}" class="w-full h-full object-cover">
+                            </div>
+                            <div class="flex-1 min-w-0 space-y-1">
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <span class="text-xs font-bold text-white truncate">#${b.id} • ${escapeHtml(b.title || 'Slide sem título')}</span>
+                                    ${statusBadge}
+                                    <span class="text-[11px] text-slate-400">Ordem: ${b.sort_order}</span>
+                                </div>
+                                <p class="text-[11px] text-slate-400 truncate">Ação: ${escapeHtml(linkLabel)}</p>
+                                <div class="flex flex-wrap gap-1.5 pt-1">
+                                    <button type="button" onclick="editHomeBanner(${b.id})" class="px-2.5 py-1 rounded-lg bg-violet-900/70 hover:bg-violet-800 text-violet-200 border border-violet-500/40 text-xs font-semibold transition">
+                                        Substituir Foto / Editar
+                                    </button>
+                                    <button type="button" onclick="toggleHomeBannerItem(${b.id})" class="px-2.5 py-1 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 text-xs font-semibold transition">
+                                        ${b.is_active ? 'Pausar' : 'Ativar'}
+                                    </button>
+                                    <button type="button" onclick="deleteHomeBanner(${b.id})" class="px-2.5 py-1 rounded-lg bg-rose-900/60 hover:bg-rose-800 text-rose-200 text-xs font-semibold transition">
+                                        Excluir
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+            } catch (e) {
+                container.innerHTML = '<div class="text-xs text-rose-400 bg-rose-950/40 border border-rose-700/40 rounded-xl p-4 text-center">Erro ao carregar lista de banners.</div>';
+            }
+        }
+
+        async function toggleGlobalHomeCarousel() {
+            const target = !homeCarouselGlobalEnabled;
+            try {
+                const res = await adminFetch('/admin/banners/toggle-global', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: target })
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    showBannerFeedback(false, data.detail || 'Erro ao alterar status do carrossel.');
+                    return;
+                }
+                renderCarouselGlobalToggle(data.enabled);
+                showBannerFeedback(true, data.message || 'Status do carrossel atualizado.');
+            } catch (e) {
+                showBannerFeedback(false, 'Erro de conexão ao alterar o carrossel.');
+            }
+        }
+
+        async function saveHomeBanner() {
+            const btn = document.getElementById('saveBannerBtn');
+            const editId = document.getElementById('bannerEditId').value.trim();
+            const payload = {
+                title: document.getElementById('bannerTitleInput').value.trim(),
+                link_url: document.getElementById('bannerLinkInput').value.trim(),
+                image_url: document.getElementById('bannerImageUrlInput').value.trim() || null,
+                image_data_url: pendingBannerDataUrl || null,
+                sort_order: parseInt(document.getElementById('bannerOrderInput').value, 10) || 0,
+                is_active: document.getElementById('bannerActiveInput').checked
+            };
+
+            if (!editId && !payload.image_data_url && !payload.image_url) {
+                showBannerFeedback(false, 'Selecione uma foto do dispositivo ou informe uma URL de imagem.');
+                return;
+            }
+
+            btn.disabled = true;
+            btn.textContent = 'Salvando...';
+            try {
+                const url = editId ? `/admin/banners/${editId}/update` : '/admin/banners';
+                const res = await adminFetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    showBannerFeedback(false, data.detail || 'Não foi possível salvar o banner.');
+                    return;
+                }
+                showBannerFeedback(true, data.message || 'Slide salvo com sucesso!');
+                resetHomeBannerForm();
+                await loadHomeBanners();
+            } catch (e) {
+                showBannerFeedback(false, 'Erro de conexão ao salvar o banner.');
+            } finally {
+                btn.disabled = false;
+                const stillEditing = document.getElementById('bannerEditId').value.trim();
+                btn.textContent = stillEditing ? `Atualizar Slide #${stillEditing}` : 'Salvar Slide no Carrossel';
+            }
+        }
+
+        async function toggleHomeBannerItem(bannerId) {
+            try {
+                const res = await adminFetch(`/admin/banners/${bannerId}/toggle`, { method: 'POST' });
+                const data = await res.json();
+                if (!res.ok) {
+                    showBannerFeedback(false, data.detail || 'Erro ao alterar slide.');
+                    return;
+                }
+                showBannerFeedback(true, data.message || 'Slide atualizado.');
+                loadHomeBanners();
+            } catch (e) {
+                showBannerFeedback(false, 'Erro de conexão ao atualizar slide.');
+            }
+        }
+
+        async function deleteHomeBanner(bannerId) {
+            if (!confirm('Deseja excluir este slide do banner carrossel?')) return;
+            try {
+                const res = await adminFetch(`/admin/banners/${bannerId}`, { method: 'DELETE' });
+                const data = await res.json();
+                if (!res.ok) {
+                    showBannerFeedback(false, data.detail || 'Erro ao excluir slide.');
+                    return;
+                }
+                if (document.getElementById('bannerEditId').value.trim() === String(bannerId)) {
+                    resetHomeBannerForm();
+                }
+                showBannerFeedback(true, data.message || 'Slide excluído.');
+                loadHomeBanners();
+            } catch (e) {
+                showBannerFeedback(false, 'Erro de conexão ao excluir slide.');
+            }
+        }
+
         // Init (painel já autenticado via cookie HttpOnly + CSRF)
         loadMetrics();
+        loadHomeBanners();
         loadReports();
         loadUsers();
         loadPushSummary();
