@@ -21,6 +21,7 @@ class User(Base):
     is_active = Column(Boolean, default=True, index=True, nullable=False)
     is_paused = Column(Boolean, default=False, index=True, nullable=False)
     is_premium = Column(Boolean, default=False, index=True, nullable=False)
+    premium_expires_at = Column(DateTime, nullable=True, index=True) # None = Vitalício quando is_premium=True
     last_active_date = Column(String(16), default="", nullable=True) # Data YYYY-MM-DD (Brasilia) da ultima ativacao
     daily_quota = Column(Integer, default=20, nullable=False)
     total_contacts_received = Column(Integer, default=0, nullable=False)

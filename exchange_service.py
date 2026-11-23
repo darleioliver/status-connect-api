@@ -155,8 +155,51 @@ async def update_ads_settings(
     }
 
 
+async def revoke_expired_premium_users(db: AsyncSession) -> int:
+    """Remove automaticamente o status Premium de usuários cujo prazo (premium_expires_at) expirou."""
+    await ensure_push_tables()
+    now = datetime.datetime.utcnow()
+    today_str = brasilia_today_str()
+    try:
+        expired_stmt = select(User.id, User.name).where(
+            User.is_premium == True,
+            User.premium_expires_at != None,
+            User.premium_expires_at <= now,
+        )
+        expired_rows = (await db.execute(expired_stmt)).all()
+        if not expired_rows:
+            return 0
+
+        expired_ids = [row[0] for row in expired_rows]
+        from sqlalchemy import update
+        await db.execute(
+            update(User)
+            .where(User.id.in_(expired_ids))
+            .values(
+                is_premium=False,
+                premium_expires_at=None,
+                last_active_date=today_str,
+                updated_at=now,
+            )
+        )
+        for uid, uname in expired_rows:
+            db.add(
+                AuditLog(
+                    user_id=uid,
+                    action="PREMIUM_EXPIRED",
+                    timestamp=now,
+                    details=f"Plano Premium de {uname} expirou automaticamente e voltou para o plano Grátis.",
+                )
+            )
+        await db.commit()
+        return len(expired_ids)
+    except Exception:
+        return 0
+
+
 async def pause_expired_free_users(db: AsyncSession):
-    """Pausa automaticamente à meia-noite (Brasília) a distribuição de usuários do plano Grátis quando ativado no painel."""
+    """Expira planos Premium vencidos e pausa à meia-noite (Brasília) usuários do plano Grátis quando ativado no painel."""
+    await revoke_expired_premium_users(db)
     if not await is_midnight_auto_pause_enabled(db):
         return
     today_str = brasilia_today_str()

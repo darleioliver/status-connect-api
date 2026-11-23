@@ -21,6 +21,11 @@ _POSTGRES_PUSH_STATEMENTS: List[str] = [
     """,
     """
     ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS premium_expires_at TIMESTAMP WITHOUT TIME ZONE NULL
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_users_premium_expires_at ON users (premium_expires_at)",
+    """
+    ALTER TABLE users
         ADD COLUMN IF NOT EXISTS last_active_date VARCHAR(16) DEFAULT ''
     """,
     """
@@ -87,6 +92,8 @@ async def _ensure_sqlite_user_columns() -> None:
         existing_cols = {row[1] for row in cols_res.fetchall()}
         if "is_premium" not in existing_cols:
             await conn.execute(text("ALTER TABLE users ADD COLUMN is_premium BOOLEAN NOT NULL DEFAULT 0"))
+        if "premium_expires_at" not in existing_cols:
+            await conn.execute(text("ALTER TABLE users ADD COLUMN premium_expires_at DATETIME NULL"))
         if "last_active_date" not in existing_cols:
             await conn.execute(text("ALTER TABLE users ADD COLUMN last_active_date VARCHAR(16) DEFAULT ''"))
 

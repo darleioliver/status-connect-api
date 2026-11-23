@@ -9,7 +9,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func, desc, update
@@ -20,6 +20,7 @@ from db_migrations import ensure_push_tables
 from models import User, ContactExchange, Report, AuditLog, DeviceToken, PushCampaign
 from schemas import PushSendRequest
 from exchange_service import (
+    brasilia_today_str,
     pause_expired_free_users,
     is_midnight_auto_pause_enabled,
     set_midnight_auto_pause_enabled,
@@ -54,6 +55,15 @@ class AdminLoginRequest(BaseModel):
 
 class AutoPauseToggleRequest(BaseModel):
     enabled: Optional[bool] = None
+
+
+class BulkPauseActionRequest(BaseModel):
+    scope: str = Field(default="all")
+
+
+class PremiumUpdateRequest(BaseModel):
+    duration: str = Field(default="lifetime")  # 1m, 2m, 6m, 12m, lifetime, custom, remove
+    expires_at: Optional[str] = Field(default=None)  # YYYY-MM-DD para data personalizada
 
 
 class AdsSettingsUpdateRequest(BaseModel):
@@ -537,19 +547,47 @@ async def save_admin_ads_settings(
 
 @router.get("/users", dependencies=[Depends(require_admin_read)])
 async def list_admin_users(
+    response: Response,
     search: str = Query(default=""),
-    limit: int = 100,
-    offset: int = 0,
+    status: str = Query(default="all"),
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db)
 ):
     await ensure_push_tables()
     await pause_expired_free_users(db)
+
+    filters = []
+    clean_search = search.strip()
+    if clean_search:
+        filters.append(User.name.ilike(f"%{clean_search}%") | User.phone_e164.ilike(f"%{clean_search}%"))
+
+    normalized_status = (status or "all").strip().lower()
+    if normalized_status == "active":
+        filters.extend([User.is_active == True, User.is_paused == False])
+    elif normalized_status == "paused":
+        filters.extend([User.is_active == True, User.is_paused == True])
+    elif normalized_status == "premium":
+        filters.append(User.is_premium == True)
+    elif normalized_status == "free":
+        filters.append(User.is_premium == False)
+    elif normalized_status == "blocked":
+        filters.append(User.is_active == False)
+
+    count_query = select(func.count(User.id))
     query = select(User)
-    if search:
-        query = query.where(User.name.ilike(f"%{search}%") | User.phone_e164.ilike(f"%{search}%"))
-    query = query.order_by(desc(User.is_premium), desc(User.created_at)).offset(offset).limit(limit)
+    if filters:
+        count_query = count_query.where(*filters)
+        query = query.where(*filters)
+
+    total_count = int((await db.execute(count_query)).scalar() or 0)
+    query = query.order_by(desc(User.is_premium), desc(User.created_at), desc(User.id)).offset(offset).limit(limit)
     res = await db.execute(query)
     users = res.scalars().all()
+
+    response.headers["X-Total-Count"] = str(total_count)
+    response.headers["X-Limit"] = str(limit)
+    response.headers["X-Offset"] = str(offset)
 
     user_ids = [u.id for u in users]
     token_counts = {}
@@ -567,7 +605,17 @@ async def list_admin_users(
         except Exception:
             # Continua listando os usuários normalmente mesmo sem registros/tabela de token FCM
             token_counts = {}
-    
+
+    now_utc = datetime.datetime.utcnow()
+
+    def _calc_days_left(exp: Optional[datetime.datetime]) -> Optional[int]:
+        if exp is None:
+            return None
+        diff_seconds = (exp - now_utc).total_seconds()
+        if diff_seconds <= 0:
+            return 0
+        return int((diff_seconds + 86399) // 86400)
+
     return [
         {
             "id": u.id,
@@ -580,6 +628,8 @@ async def list_admin_users(
             "is_active": u.is_active,
             "is_paused": u.is_paused,
             "is_premium": bool(u.is_premium),
+            "premium_expires_at": u.premium_expires_at.isoformat() if (u.is_premium and u.premium_expires_at) else None,
+            "premium_days_left": _calc_days_left(u.premium_expires_at) if u.is_premium else None,
             "has_fcm_token": token_counts.get(u.id, 0) > 0,
             "fcm_token_count": token_counts.get(u.id, 0),
             "total_received": u.total_contacts_received,
@@ -590,6 +640,195 @@ async def list_admin_users(
         for u in users
     ]
 
+
+@router.post("/users/bulk-pause", dependencies=[Depends(require_admin_write)])
+async def bulk_pause_users(
+    payload: Optional[BulkPauseActionRequest] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    scope = ((payload.scope if payload else "all") or "all").strip().lower()
+    if scope not in ("all", "free", "premium"):
+        raise HTTPException(status_code=400, detail="Escopo inválido. Use 'all', 'free' ou 'premium'.")
+
+    conditions = [User.is_active == True, User.is_paused == False]
+    if scope == "free":
+        conditions.append(User.is_premium == False)
+    elif scope == "premium":
+        conditions.append(User.is_premium == True)
+
+    count_res = await db.execute(select(func.count(User.id)).where(*conditions))
+    affected_count = int(count_res.scalar() or 0)
+
+    if affected_count > 0:
+        await db.execute(
+            update(User)
+            .where(*conditions)
+            .values(is_paused=True, updated_at=datetime.datetime.utcnow())
+        )
+        db.add(AuditLog(
+            user_id=None,
+            action="ADMIN_BULK_PAUSE",
+            timestamp=datetime.datetime.utcnow(),
+            details=f"Administrador pausou {affected_count} usuários em massa (escopo={scope})."
+        ))
+        await db.commit()
+
+    return {
+        "success": True,
+        "affected_count": affected_count,
+        "scope": scope,
+        "message": (
+            f"{affected_count} usuário(s) pausado(s) com sucesso."
+            if affected_count > 0
+            else "Nenhum usuário ativo disponível para pausar."
+        )
+    }
+
+
+@router.post("/users/bulk-activate", dependencies=[Depends(require_admin_write)])
+async def bulk_activate_users(
+    payload: Optional[BulkPauseActionRequest] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    scope = ((payload.scope if payload else "all") or "all").strip().lower()
+    if scope not in ("all", "free", "premium"):
+        raise HTTPException(status_code=400, detail="Escopo inválido. Use 'all', 'free' ou 'premium'.")
+
+    conditions = [User.is_active == True, User.is_paused == True]
+    if scope == "free":
+        conditions.append(User.is_premium == False)
+    elif scope == "premium":
+        conditions.append(User.is_premium == True)
+
+    count_res = await db.execute(select(func.count(User.id)).where(*conditions))
+    affected_count = int(count_res.scalar() or 0)
+    today_brt = brasilia_today_str()
+
+    if affected_count > 0:
+        await db.execute(
+            update(User)
+            .where(*conditions)
+            .values(
+                is_paused=False,
+                last_active_date=today_brt,
+                updated_at=datetime.datetime.utcnow(),
+            )
+        )
+        db.add(AuditLog(
+            user_id=None,
+            action="ADMIN_BULK_ACTIVATE",
+            timestamp=datetime.datetime.utcnow(),
+            details=f"Administrador ativou {affected_count} usuários pausados em massa (escopo={scope})."
+        ))
+        await db.commit()
+
+    return {
+        "success": True,
+        "affected_count": affected_count,
+        "scope": scope,
+        "message": (
+            f"{affected_count} usuário(s) ativado(s) com sucesso!"
+            if affected_count > 0
+            else "Todos os usuários elegíveis já estão ativos."
+        )
+    }
+
+
+@router.post("/users/{user_id}/premium", dependencies=[Depends(require_admin_write)])
+async def set_user_premium_plan(
+    user_id: int,
+    payload: PremiumUpdateRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    await ensure_push_tables()
+    user = await db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+
+    now = datetime.datetime.utcnow()
+    duration = (payload.duration or "lifetime").strip().lower()
+    duration_days_map = {
+        "1m": (30, "1 mês (30 dias)"),
+        "2m": (60, "2 meses (60 dias)"),
+        "6m": (180, "6 meses (180 dias)"),
+        "12m": (365, "1 ano (365 dias)"),
+    }
+
+    if duration == "remove":
+        user.is_premium = False
+        user.premium_expires_at = None
+        user.last_active_date = brasilia_today_str()
+        user.updated_at = now
+        plan_label = "Grátis"
+        action_name = "PREMIUM_REVOKED"
+        details = f"Administrador removeu o plano Premium de {user.name}."
+        msg = f"Plano Premium removido de {user.name} (voltou para Grátis)."
+    elif duration == "lifetime":
+        user.is_premium = True
+        user.premium_expires_at = None
+        user.is_paused = False
+        user.last_active_date = brasilia_today_str()
+        user.updated_at = now
+        plan_label = "★ Vitalício"
+        action_name = "PREMIUM_GRANTED"
+        details = f"Administrador ativou Premium Vitalício para {user.name}."
+        msg = f"{user.name} agora é ★ Premium Vitalício!"
+    elif duration in duration_days_map:
+        days, label = duration_days_map[duration]
+        # Se já é Premium com validade futura, soma a partir de hoje (renovação limpa a partir de agora)
+        expires_at = now + datetime.timedelta(days=days)
+        user.is_premium = True
+        user.premium_expires_at = expires_at
+        user.is_paused = False
+        user.last_active_date = brasilia_today_str()
+        user.updated_at = now
+        brt_exp = expires_at - datetime.timedelta(hours=3)
+        exp_str = brt_exp.strftime("%d/%m/%Y")
+        plan_label = f"Válido até {exp_str}"
+        action_name = "PREMIUM_GRANTED"
+        details = f"Administrador ativou Premium ({label}) para {user.name}, válido até {exp_str}."
+        msg = f"{user.name} agora é ★ Premium por {label} (válido até {exp_str})!"
+    elif duration == "custom":
+        raw_date = (payload.expires_at or "").strip()
+        if not raw_date:
+            raise HTTPException(status_code=400, detail="Informe a data de validade (YYYY-MM-DD).")
+        try:
+            parsed_date = datetime.datetime.strptime(raw_date[:10], "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Data inválida. Use o formato AAAA-MM-DD.")
+        # Fim do dia no horário de Brasília (23:59:59 BRT = +03:00 UTC)
+        expires_at = parsed_date.replace(hour=23, minute=59, second=59) + datetime.timedelta(hours=3)
+        if expires_at <= now:
+            raise HTTPException(status_code=400, detail="A data de validade deve ser no futuro.")
+        user.is_premium = True
+        user.premium_expires_at = expires_at
+        user.is_paused = False
+        user.last_active_date = brasilia_today_str()
+        user.updated_at = now
+        exp_str = parsed_date.strftime("%d/%m/%Y")
+        plan_label = f"Válido até {exp_str}"
+        action_name = "PREMIUM_GRANTED"
+        details = f"Administrador ativou Premium personalizado para {user.name}, válido até {exp_str}."
+        msg = f"{user.name} agora é ★ Premium válido até {exp_str}!"
+    else:
+        raise HTTPException(status_code=400, detail="Duração inválida. Use 1m, 2m, 6m, 12m, lifetime, custom ou remove.")
+
+    db.add(AuditLog(
+        user_id=user.id,
+        action=action_name,
+        timestamp=now,
+        details=details,
+    ))
+    await db.commit()
+    return {
+        "success": True,
+        "is_premium": bool(user.is_premium),
+        "premium_expires_at": user.premium_expires_at.isoformat() if user.premium_expires_at else None,
+        "plan_label": plan_label,
+        "message": msg,
+    }
+
+
 @router.post("/users/{user_id}/toggle-premium", dependencies=[Depends(require_admin_write)])
 async def toggle_user_premium(user_id: int, db: AsyncSession = Depends(get_db)):
     user = await db.get(User, user_id)
@@ -598,17 +837,21 @@ async def toggle_user_premium(user_id: int, db: AsyncSession = Depends(get_db)):
     user.is_premium = not bool(user.is_premium)
     if user.is_premium:
         user.is_paused = False
+        user.premium_expires_at = None
+    else:
+        user.premium_expires_at = None
     audit = AuditLog(
         user_id=user.id,
         action="PREMIUM_GRANTED" if user.is_premium else "PREMIUM_REVOKED",
         timestamp=datetime.datetime.utcnow(),
-        details=f"Administrador alterou o plano de {user.name} para {'Premium' if user.is_premium else 'Grátis'}."
+        details=f"Administrador alterou o plano de {user.name} para {'Premium Vitalício' if user.is_premium else 'Grátis'}."
     )
     db.add(audit)
     await db.commit()
     return {
         "is_premium": user.is_premium,
-        "message": f"Usuário agora é {'★ Premium' if user.is_premium else 'Grátis'}!"
+        "premium_expires_at": None,
+        "message": f"Usuário agora é {'★ Premium Vitalício' if user.is_premium else 'Grátis'}!"
     }
 
 @router.post("/users/{user_id}/toggle-pause", dependencies=[Depends(require_admin_write)])
@@ -617,6 +860,8 @@ async def toggle_user_pause(user_id: int, db: AsyncSession = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404, detail="Usuário não encontrado.")
     user.is_paused = not user.is_paused
+    if not user.is_paused:
+        user.last_active_date = brasilia_today_str()
     await db.commit()
     return {"message": f"Usuário {'pausado' if user.is_paused else 'reativado'} com sucesso."}
 
@@ -1217,19 +1462,54 @@ async def admin_dashboard(request: Request):
 
         <!-- Seção de Gerenciamento de Usuários -->
         <div class="bg-slate-800/80 border border-slate-700/80 rounded-2xl p-6 shadow-sm">
-            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
+            <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-4 mb-4">
                 <div>
                     <h2 class="text-lg font-semibold text-white">Participantes da Rede</h2>
                     <p class="text-sm text-slate-400">Gerencie usuários, planos Premium/Grátis, tokens push e status de compartilhamento</p>
                 </div>
-                <div class="flex items-center gap-3">
-                    <input id="searchInput" type="text" placeholder="Buscar por nome ou WhatsApp..." 
-                           class="bg-slate-900 border border-slate-700 rounded-xl px-4 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500 w-64 sm:w-80">
-                    <button onclick="loadUsers()" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-sm rounded-xl transition">
-                        Buscar
+                <div class="flex flex-wrap items-center gap-2.5">
+                    <button id="btnBulkPauseAll" onclick="bulkPauseAllUsers()"
+                            class="px-3.5 py-2 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 font-semibold text-sm rounded-xl transition">
+                        ⏸ Pausar Todos
+                    </button>
+                    <button id="btnBulkActivateAll" onclick="bulkActivateAllUsers()"
+                            class="px-3.5 py-2 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 font-semibold text-sm rounded-xl transition">
+                        ▶ Ativar Todos
                     </button>
                 </div>
             </div>
+
+            <div class="flex flex-col md:flex-row md:items-center justify-between gap-3 mb-4">
+                <div class="flex flex-wrap items-center gap-2.5 flex-1">
+                    <input id="searchInput" type="text" placeholder="Buscar por nome ou WhatsApp..."
+                           onkeydown="if (event.key === 'Enter') searchUsersFromStart();"
+                           class="bg-slate-900 border border-slate-700 rounded-xl px-4 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500 w-full sm:w-72">
+                    <select id="userStatusFilter" onchange="searchUsersFromStart()"
+                            class="bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                        <option value="all">Todos os Status</option>
+                        <option value="active">Somente Ativos</option>
+                        <option value="paused">Somente Pausados</option>
+                        <option value="premium">★ Somente Premium</option>
+                        <option value="free">Somente Grátis</option>
+                        <option value="blocked">Bloqueados</option>
+                    </select>
+                    <button onclick="searchUsersFromStart()" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-sm rounded-xl transition">
+                        Buscar
+                    </button>
+                </div>
+                <div class="flex items-center gap-2 text-xs text-slate-400">
+                    <label for="usersPageSizeSelect">Por página:</label>
+                    <select id="usersPageSizeSelect" onchange="changeUsersPageSize()"
+                            class="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                        <option value="25">25</option>
+                        <option value="50" selected>50</option>
+                        <option value="100">100</option>
+                        <option value="200">200</option>
+                    </select>
+                </div>
+            </div>
+
+            <div id="usersBulkFeedback" class="hidden mb-4 rounded-xl px-4 py-2.5 text-sm border"></div>
 
             <!-- Tabela -->
             <div class="overflow-x-auto">
@@ -1252,6 +1532,34 @@ async def admin_dashboard(request: Request):
                     </tbody>
                 </table>
             </div>
+
+            <!-- Paginação -->
+            <div class="mt-5 pt-4 border-t border-slate-700/70 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div id="usersPaginationInfo" class="text-xs text-slate-400">
+                    Carregando paginação...
+                </div>
+                <div class="flex items-center gap-2 flex-wrap">
+                    <button id="btnUsersFirst" onclick="goToUsersPage(1)" disabled
+                            class="px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-xs font-medium text-slate-300 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                        « Primeira
+                    </button>
+                    <button id="btnUsersPrev" onclick="goToUsersPage(currentUsersPage - 1)" disabled
+                            class="px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-xs font-medium text-slate-300 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                        ‹ Anterior
+                    </button>
+                    <span id="usersPageIndicator" class="px-3 py-1.5 rounded-lg bg-slate-900/80 border border-slate-700/80 text-xs font-semibold text-white">
+                        Página 1 de 1
+                    </span>
+                    <button id="btnUsersNext" onclick="goToUsersPage(currentUsersPage + 1)" disabled
+                            class="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white disabled:bg-slate-900 disabled:border disabled:border-slate-700 disabled:text-slate-500 disabled:opacity-50 disabled:cursor-not-allowed transition">
+                        Próxima ›
+                    </button>
+                    <button id="btnUsersLast" onclick="goToUsersPage(totalUsersPages)" disabled
+                            class="px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-xs font-medium text-slate-300 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                        Última »
+                    </button>
+                </div>
+            </div>
         </div>
     </main>
 
@@ -1272,6 +1580,66 @@ async def admin_dashboard(request: Request):
                 </button>
                 <button id="confirmSendBtn" onclick="confirmBulkPushSend()" class="px-5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-sm font-bold transition">
                     Confirmar e Enviar
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal de Escolha de Validade do Plano Premium -->
+    <div id="premiumPlanModal" class="hidden fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="bg-slate-800 border border-amber-500/40 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4">
+            <div class="flex items-start justify-between gap-3">
+                <div>
+                    <h3 class="text-lg font-bold text-amber-300">★ Definir Plano Premium</h3>
+                    <p id="premiumModalUserInfo" class="text-sm text-slate-300 mt-0.5">--</p>
+                </div>
+                <button onclick="closePremiumModal()" class="text-slate-400 hover:text-white text-lg leading-none px-2 py-1 rounded-lg hover:bg-slate-700">✕</button>
+            </div>
+
+            <div id="premiumModalCurrentStatus" class="text-xs px-3 py-2 rounded-xl bg-slate-900/90 border border-slate-700 text-slate-300">
+                Status atual: --
+            </div>
+
+            <div class="space-y-2">
+                <p class="text-xs font-semibold uppercase tracking-wider text-slate-400">Escolha o tempo de validade</p>
+                <div class="grid grid-cols-2 gap-2.5">
+                    <button onclick="applyPremiumDuration('1m')" class="premium-dur-btn px-3.5 py-3 rounded-xl bg-slate-900 hover:bg-amber-500/20 border border-slate-700 hover:border-amber-500/60 text-left transition">
+                        <div class="text-sm font-bold text-white">1 Mês</div>
+                        <div class="text-xs text-slate-400">30 dias de acesso</div>
+                    </button>
+                    <button onclick="applyPremiumDuration('2m')" class="premium-dur-btn px-3.5 py-3 rounded-xl bg-slate-900 hover:bg-amber-500/20 border border-slate-700 hover:border-amber-500/60 text-left transition">
+                        <div class="text-sm font-bold text-white">2 Meses</div>
+                        <div class="text-xs text-slate-400">60 dias de acesso</div>
+                    </button>
+                    <button onclick="applyPremiumDuration('6m')" class="premium-dur-btn px-3.5 py-3 rounded-xl bg-slate-900 hover:bg-amber-500/20 border border-slate-700 hover:border-amber-500/60 text-left transition">
+                        <div class="text-sm font-bold text-white">6 Meses</div>
+                        <div class="text-xs text-slate-400">180 dias de acesso</div>
+                    </button>
+                    <button onclick="applyPremiumDuration('lifetime')" class="premium-dur-btn px-3.5 py-3 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/50 text-left transition">
+                        <div class="text-sm font-bold text-amber-300">★ Vitalício</div>
+                        <div class="text-xs text-amber-200/80">Sem data de expiração</div>
+                    </button>
+                </div>
+            </div>
+
+            <div class="pt-2 border-t border-slate-700/70 space-y-2">
+                <label for="premiumCustomDateInput" class="block text-xs font-semibold text-slate-400">Ou escolha uma data exata de validade:</label>
+                <div class="flex gap-2">
+                    <input id="premiumCustomDateInput" type="date"
+                           class="flex-1 bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-amber-500">
+                    <button onclick="applyPremiumDuration('custom')" class="premium-dur-btn px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold transition">
+                        Salvar Data
+                    </button>
+                </div>
+            </div>
+
+            <div class="flex items-center justify-between gap-2 pt-2 border-t border-slate-700/70">
+                <button id="btnModalRemovePremium" onclick="applyPremiumDuration('remove')"
+                        class="hidden premium-dur-btn px-3.5 py-2 rounded-xl bg-rose-900/60 hover:bg-rose-800 text-rose-200 border border-rose-500/40 text-xs font-semibold transition">
+                    Remover Premium (Grátis)
+                </button>
+                <button onclick="closePremiumModal()" class="ml-auto px-4 py-2 rounded-xl bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm font-medium transition">
+                    Fechar
                 </button>
             </div>
         </div>
@@ -1749,19 +2117,156 @@ async def admin_dashboard(request: Request):
             if (currentVal) selectEl.value = currentVal;
         }
 
-        async function loadUsers() {
-            const search = document.getElementById('searchInput').value;
-            const tbody = document.getElementById('userTableBody');
+        let currentUsersPage = 1;
+        let usersPageSize = 50;
+        let totalUsersCount = 0;
+        let totalUsersPages = 1;
+
+        function showUsersBulkFeedback(isOk, message) {
+            const box = document.getElementById('usersBulkFeedback');
+            if (!box) return;
+            box.textContent = message;
+            box.className = isOk
+                ? 'mb-4 rounded-xl px-4 py-2.5 text-sm border bg-emerald-500/15 border-emerald-500/40 text-emerald-300'
+                : 'mb-4 rounded-xl px-4 py-2.5 text-sm border bg-rose-500/15 border-rose-500/40 text-rose-300';
+        }
+
+        function updateUsersPaginationControls(renderedCount) {
+            totalUsersPages = Math.max(1, Math.ceil(totalUsersCount / usersPageSize));
+            if (currentUsersPage > totalUsersPages) {
+                currentUsersPage = totalUsersPages;
+            }
+            const infoEl = document.getElementById('usersPaginationInfo');
+            const indicatorEl = document.getElementById('usersPageIndicator');
+            const btnFirst = document.getElementById('btnUsersFirst');
+            const btnPrev = document.getElementById('btnUsersPrev');
+            const btnNext = document.getElementById('btnUsersNext');
+            const btnLast = document.getElementById('btnUsersLast');
+
+            if (totalUsersCount === 0 || renderedCount === 0) {
+                if (infoEl) infoEl.textContent = 'Mostrando 0 de 0 usuários';
+            } else {
+                const startItem = (currentUsersPage - 1) * usersPageSize + 1;
+                const endItem = Math.min(startItem + renderedCount - 1, totalUsersCount);
+                if (infoEl) infoEl.textContent = `Mostrando ${startItem}–${endItem} de ${totalUsersCount} usuários`;
+            }
+
+            if (indicatorEl) indicatorEl.textContent = `Página ${currentUsersPage} de ${totalUsersPages}`;
+            if (btnFirst) btnFirst.disabled = currentUsersPage <= 1;
+            if (btnPrev) btnPrev.disabled = currentUsersPage <= 1;
+            if (btnNext) btnNext.disabled = currentUsersPage >= totalUsersPages;
+            if (btnLast) btnLast.disabled = currentUsersPage >= totalUsersPages;
+        }
+
+        function searchUsersFromStart() {
+            currentUsersPage = 1;
+            loadUsers();
+        }
+
+        function changeUsersPageSize() {
+            const sel = document.getElementById('usersPageSizeSelect');
+            usersPageSize = Math.max(10, Math.min(200, Number(sel ? sel.value : 50) || 50));
+            currentUsersPage = 1;
+            loadUsers();
+        }
+
+        function goToUsersPage(targetPage) {
+            const safePage = Math.max(1, Math.min(totalUsersPages, Number(targetPage) || 1));
+            if (safePage === currentUsersPage) return;
+            currentUsersPage = safePage;
+            loadUsers();
+            const tableEl = document.getElementById('userTableBody');
+            if (tableEl) {
+                tableEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            }
+        }
+
+        async function bulkPauseAllUsers() {
+            if (!confirm('Tem certeza que deseja PAUSAR TODOS os usuários ativos da rede agora?\n\nUsuários bloqueados não serão alterados.')) {
+                return;
+            }
+            const pauseBtn = document.getElementById('btnBulkPauseAll');
+            const activateBtn = document.getElementById('btnBulkActivateAll');
+            if (pauseBtn) { pauseBtn.disabled = true; pauseBtn.textContent = 'Pausando...'; }
+            if (activateBtn) activateBtn.disabled = true;
             try {
-                const res = await adminFetch(`/admin/users?search=${encodeURIComponent(search)}`);
+                const res = await adminFetch('/admin/users/bulk-pause', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ scope: 'all' })
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    showUsersBulkFeedback(false, data.detail || 'Não foi possível pausar os usuários.');
+                    return;
+                }
+                showUsersBulkFeedback(true, data.message || 'Usuários pausados com sucesso.');
+                loadUsers();
+                loadMetrics();
+                loadPushSummary();
+            } catch (e) {
+                showUsersBulkFeedback(false, 'Erro de conexão ao pausar todos os usuários.');
+            } finally {
+                if (pauseBtn) { pauseBtn.disabled = false; pauseBtn.textContent = '⏸ Pausar Todos'; }
+                if (activateBtn) activateBtn.disabled = false;
+            }
+        }
+
+        async function bulkActivateAllUsers() {
+            if (!confirm('Tem certeza que deseja ATIVAR TODOS os usuários pausados da rede agora?\n\nUsuários bloqueados continuam bloqueados.')) {
+                return;
+            }
+            const pauseBtn = document.getElementById('btnBulkPauseAll');
+            const activateBtn = document.getElementById('btnBulkActivateAll');
+            if (activateBtn) { activateBtn.disabled = true; activateBtn.textContent = 'Ativando...'; }
+            if (pauseBtn) pauseBtn.disabled = true;
+            try {
+                const res = await adminFetch('/admin/users/bulk-activate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ scope: 'all' })
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    showUsersBulkFeedback(false, data.detail || 'Não foi possível ativar os usuários.');
+                    return;
+                }
+                showUsersBulkFeedback(true, data.message || 'Usuários ativados com sucesso.');
+                loadUsers();
+                loadMetrics();
+                loadPushSummary();
+            } catch (e) {
+                showUsersBulkFeedback(false, 'Erro de conexão ao ativar todos os usuários.');
+            } finally {
+                if (activateBtn) { activateBtn.disabled = false; activateBtn.textContent = '▶ Ativar Todos'; }
+                if (pauseBtn) pauseBtn.disabled = false;
+            }
+        }
+
+        async function loadUsers() {
+            const search = (document.getElementById('searchInput')?.value || '').trim();
+            const status = (document.getElementById('userStatusFilter')?.value || 'all').trim();
+            const tbody = document.getElementById('userTableBody');
+            const offset = (currentUsersPage - 1) * usersPageSize;
+            try {
+                const res = await adminFetch(
+                    `/admin/users?search=${encodeURIComponent(search)}&status=${encodeURIComponent(status)}&limit=${usersPageSize}&offset=${offset}`
+                );
                 if (!res.ok) {
                     throw new Error(`HTTP ${res.status}`);
                 }
+                const headerTotal = Number(res.headers.get('X-Total-Count'));
                 const users = await res.json();
                 if (!Array.isArray(users)) {
                     throw new Error('Resposta inválida ao listar usuários');
                 }
-                if (!search) {
+                totalUsersCount = Number.isFinite(headerTotal) && headerTotal >= 0 ? headerTotal : users.length;
+                if (users.length === 0 && totalUsersCount > 0 && currentUsersPage > 1) {
+                    currentUsersPage = Math.max(1, Math.ceil(totalUsersCount / usersPageSize));
+                    return loadUsers();
+                }
+                updateUsersPaginationControls(users.length);
+                if (!search && status === 'all' && currentUsersPage === 1) {
                     populateTestUserSelect(users);
                 }
                 if (users.length === 0) {
@@ -1774,6 +2279,27 @@ async def admin_dashboard(request: Request):
                     const tokenBadge = u.has_fcm_token
                         ? '<span class="text-[10px] px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-300 border border-sky-500/30">📱 Push</span>'
                         : '<span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-700/80 text-slate-400 border border-slate-600/60">Sem token</span>';
+                    const planBadgeHtml = (() => {
+                        if (!u.is_premium) {
+                            return '<span class="text-xs px-2.5 py-0.5 rounded-full bg-slate-700 text-slate-300">Grátis</span>';
+                        }
+                        if (!u.premium_expires_at) {
+                            return `
+                                <div class="flex flex-col items-start gap-0.5">
+                                    <span class="text-xs px-2.5 py-0.5 rounded-full font-bold bg-amber-500/20 text-amber-300 border border-amber-500/50">★ PREMIUM</span>
+                                    <span class="text-[11px] text-amber-200/80 font-medium">Vitalício</span>
+                                </div>`;
+                        }
+                        const expText = formatPremiumExpiryBr(u.premium_expires_at);
+                        const daysLeft = u.premium_days_left;
+                        const urgentCls = (daysLeft != null && daysLeft <= 5) ? 'text-rose-300' : 'text-emerald-300/90';
+                        const daysLabel = daysLeft != null ? ` (${daysLeft}d)` : '';
+                        return `
+                            <div class="flex flex-col items-start gap-0.5">
+                                <span class="text-xs px-2.5 py-0.5 rounded-full font-bold bg-amber-500/20 text-amber-300 border border-amber-500/50">★ PREMIUM</span>
+                                <span class="text-[11px] ${urgentCls}">Até ${escapeHtml(expText)}${escapeHtml(daysLabel)}</span>
+                            </div>`;
+                    })();
                     return `
                     <tr class="hover:bg-slate-700/30 transition ${u.is_premium ? 'bg-amber-500/5' : ''}">
                         <td class="py-3 px-4 font-medium text-white flex items-center gap-2">
@@ -1791,9 +2317,7 @@ async def admin_dashboard(request: Request):
                         <td class="py-3 px-4 text-emerald-400 font-mono text-xs">${escapeHtml(u.phone_e164)}</td>
                         <td class="py-3 px-4 text-xs text-slate-300">${escapeHtml(u.state || '--')} • ${escapeHtml(u.gender || '--')}</td>
                         <td class="py-3 px-4">
-                            ${u.is_premium
-                                ? '<span class="text-xs px-2.5 py-0.5 rounded-full font-bold bg-amber-500/20 text-amber-300 border border-amber-500/50">★ PREMIUM</span>'
-                                : '<span class="text-xs px-2.5 py-0.5 rounded-full bg-slate-700 text-slate-300">Grátis</span>'}
+                            ${planBadgeHtml}
                         </td>
                         <td class="py-3 px-4">
                             <span class="px-2 py-0.5 rounded text-xs font-semibold ${Number(score) >= 1.0 ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30' : 'bg-amber-500/10 text-amber-400 border border-amber-500/30'}">
@@ -1806,8 +2330,8 @@ async def admin_dashboard(request: Request):
                               '<span class="text-xs px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300">Ativo</span>'}
                         </td>
                         <td class="py-3 px-4 text-right space-x-1.5 whitespace-nowrap">
-                            <button onclick="togglePremium(${u.id})" class="text-xs px-2.5 py-1 rounded font-semibold ${u.is_premium ? 'bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40' : 'bg-amber-600 hover:bg-amber-500 text-slate-950'} transition">
-                                ${u.is_premium ? 'Remover Premium' : '★ Tornar Premium'}
+                            <button onclick="openPremiumModal(${u.id})" class="text-xs px-2.5 py-1 rounded font-semibold ${u.is_premium ? 'bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40' : 'bg-amber-600 hover:bg-amber-500 text-slate-950'} transition">
+                                ${u.is_premium ? '★ Alterar / Remover' : '★ Tornar Premium'}
                             </button>
                             <button onclick="togglePause(${u.id})" class="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 transition">
                                 ${u.is_paused ? 'Reativar' : 'Pausar'}
@@ -1819,20 +2343,111 @@ async def admin_dashboard(request: Request):
                     </tr>
                 `;
                 }).join('');
+                window._lastLoadedUsersMap = Object.fromEntries(users.map(u => [u.id, u]));
             } catch(e) {
                 tbody.innerHTML = '<tr><td colspan="7" class="text-center py-6 text-rose-400">Erro ao buscar dados.</td></tr>';
             }
         }
 
-        async function togglePremium(id) {
+        let selectedPremiumUserId = null;
+
+        function formatPremiumExpiryBr(isoUtc) {
+            if (!isoUtc) return 'Vitalício';
             try {
-                const res = await adminFetch(`/admin/users/${id}/toggle-premium`, { method: 'POST' });
-                if (!res.ok) return;
+                const raw = isoUtc.endsWith('Z') ? isoUtc : `${isoUtc}Z`;
+                const dt = new Date(raw);
+                if (isNaN(dt.getTime())) return isoUtc.slice(0, 10);
+                return dt.toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+            } catch (_) {
+                return isoUtc.slice(0, 10);
+            }
+        }
+
+        function openPremiumModal(userId) {
+            const user = (window._lastLoadedUsersMap || {})[userId];
+            if (!user) return;
+            selectedPremiumUserId = userId;
+            const infoEl = document.getElementById('premiumModalUserInfo');
+            const statusEl = document.getElementById('premiumModalCurrentStatus');
+            const removeBtn = document.getElementById('btnModalRemovePremium');
+            const dateInput = document.getElementById('premiumCustomDateInput');
+
+            if (infoEl) {
+                infoEl.textContent = `${user.name || 'Participante'} — ${user.phone_e164 || ''}`;
+            }
+            if (statusEl) {
+                if (user.is_premium) {
+                    const expLabel = user.premium_expires_at
+                        ? `★ Premium válido até ${formatPremiumExpiryBr(user.premium_expires_at)}`
+                        : '★ Premium Vitalício (sem vencimento)';
+                    statusEl.textContent = `Status atual: ${expLabel}`;
+                } else {
+                    statusEl.textContent = 'Status atual: Plano Grátis';
+                }
+            }
+            if (removeBtn) {
+                if (user.is_premium) {
+                    removeBtn.classList.remove('hidden');
+                } else {
+                    removeBtn.classList.add('hidden');
+                }
+            }
+            if (dateInput) {
+                const defaultDate = new Date(Date.now() + 30 * 86400000);
+                dateInput.min = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+                dateInput.value = user.premium_expires_at
+                    ? user.premium_expires_at.slice(0, 10)
+                    : defaultDate.toISOString().slice(0, 10);
+            }
+            const modal = document.getElementById('premiumPlanModal');
+            if (modal) modal.classList.remove('hidden');
+        }
+
+        function closePremiumModal() {
+            selectedPremiumUserId = null;
+            const modal = document.getElementById('premiumPlanModal');
+            if (modal) modal.classList.add('hidden');
+        }
+
+        async function applyPremiumDuration(duration) {
+            if (!selectedPremiumUserId) return;
+            const payload = { duration };
+            if (duration === 'custom') {
+                const dateVal = (document.getElementById('premiumCustomDateInput')?.value || '').trim();
+                if (!dateVal) {
+                    alert('Selecione uma data de validade primeiro.');
+                    return;
+                }
+                payload.expires_at = dateVal;
+            }
+            if (duration === 'remove') {
+                if (!confirm('Deseja remover o Premium deste usuário e retorná-lo para o plano Grátis?')) {
+                    return;
+                }
+            }
+
+            const buttons = document.querySelectorAll('.premium-dur-btn');
+            buttons.forEach(b => { b.disabled = true; });
+            try {
+                const res = await adminFetch(`/admin/users/${selectedPremiumUserId}/premium`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    alert(data.detail || 'Não foi possível atualizar o plano Premium.');
+                    return;
+                }
+                closePremiumModal();
+                showUsersBulkFeedback(true, data.message || 'Plano Premium atualizado!');
                 loadUsers();
                 loadMetrics();
                 loadPushSummary();
             } catch (e) {
-                console.error(e);
+                alert('Erro de conexão ao atualizar o plano Premium.');
+            } finally {
+                buttons.forEach(b => { b.disabled = false; });
             }
         }
 
