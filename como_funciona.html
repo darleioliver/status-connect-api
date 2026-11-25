@@ -111,6 +111,25 @@
       font-size: 1.75rem;
       line-height: 1.25;
     }
+    .video-wrapper {
+      position: relative;
+      width: 100%;
+      padding-bottom: 56.25%; /* Proporção 16:9 */
+      margin-top: 18px;
+      border-radius: 14px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      background: #000;
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+    }
+    .video-wrapper iframe {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+    }
     .card {
       background: var(--surface);
       border: 1px solid var(--border);
@@ -239,7 +258,6 @@
   </style>
 </head>
 <body>
-  <!-- Página simples e editável: você pode editar textos, links ou cores e subir no GitHub / Railway -->
   <header class="topbar">
     <div class="topbar-inner">
       <div class="brand">
@@ -257,16 +275,26 @@
 
   <main class="container">
     <section class="hero">
-      <span class="pill">Guia Rápido</span>
+      <span class="pill">Atualizado • Tutorial Completo</span>
       <h1>Como Funciona o Visualizações no Status</h1>
       <p>
-        O <strong>Visualizações no Status</strong> conecta pessoas reais que desejam aumentar o alcance
-        orgânico dos seus Status no WhatsApp de forma voluntária, simples e recíproca.
+        O <strong>Visualizações no Status</strong> conecta participantes ativos para aumentar o alcance
+        orgânico dos seus Status no WhatsApp de forma simples, segura e recíproca.
       </p>
       <p>
-        No WhatsApp, duas pessoas só enxergam os Status uma da outra quando <strong>ambas têm o número salvo na agenda</strong>.
-        Nosso aplicativo facilita essa troca justa entre participantes ativos da comunidade.
+        Como o WhatsApp só exibe os Status quando <strong>ambas as pessoas têm o número salvo na agenda</strong>,
+        o aplicativo automatiza essa troca para você ganhar visualizações reais todos os dias.
       </p>
+
+      <div class="video-wrapper">
+        <iframe
+          src="https://www.youtube.com/embed/S0LD0sh0y8g"
+          title="Como ter muitas visualizações nos status do WhatsApp"
+          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+          referrerpolicy="strict-origin-when-cross-origin"
+          allowfullscreen>
+        </iframe>
+      </div>
     </section>
 
     <section id="passo-a-passo" class="card">
@@ -274,23 +302,23 @@
       <div class="steps-grid">
         <div class="step-box">
           <div class="step-number">1</div>
-          <h3>Faça seu Cadastro</h3>
-          <p>Informe seu nome, número de WhatsApp, uma bio curta, seu Estado (UF) e sexo para entrar na rede.</p>
+          <h3>Cadastre seu Número</h3>
+          <p>Toque em <strong>Cadastrar número</strong>, informe seu nome, WhatsApp, estado, sexo, uma bio curta e confirme a titularidade do número.</p>
         </div>
         <div class="step-box">
           <div class="step-number">2</div>
-          <h3>Salve os Contatos</h3>
-          <p>Toque em <strong>Salvar Todos os Contatos</strong> na tela inicial para adicionar os participantes na sua agenda de uma só vez.</p>
+          <h3>Verifique Contatos Novos</h3>
+          <p>Acesse a aba <strong>Contatos</strong>, toque em <strong>Verificar contatos não salvos</strong> e conceda a permissão. O app filtra apenas números novos, sem duplicar sua agenda.</p>
         </div>
         <div class="step-box">
           <div class="step-number">3</div>
-          <h3>Receba Reciprocidade</h3>
-          <p>Enquanto sua conta estiver ativa, seu número também é entregue para outros participantes salvarem na agenda deles.</p>
+          <h3>Salve Todos em 1 Toque</h3>
+          <p>Toque em <strong>Salvar todos</strong> para adicionar os novos participantes automaticamente e volte diariamente para buscar mais contatos.</p>
         </div>
         <div class="step-box">
           <div class="step-number">4</div>
-          <h3>Poste seus Status</h3>
-          <p>Publique seus Status normalmente no WhatsApp e acompanhe suas visualizações crescerem de forma orgânica.</p>
+          <h3>Aguarde e Poste Status</h3>
+          <p>Seu número já fica visível na rede. Assim que outros usuários salvarem você, seus Status passarão a receber muito mais visualizações.</p>
         </div>
       </div>
     </section>
@@ -316,16 +344,16 @@
         <div class="plan-card">
           <h3>Plano Grátis</h3>
           <ul>
-            <li>Participação gratuita na rede de troca recíproca.</li>
-            <li>Botão <strong>Salvar Todos</strong> para adicionar os contatos da rede em lote.</li>
-            <li>A divulgação pausa automaticamente às <strong>00:00 (horário de Brasília)</strong> — basta abrir o app e reativar em 1 toque no dia seguinte.</li>
+            <li>Participação gratuita na rede de troca recíproca com filtro anti-duplicidade.</li>
+            <li>Botão <strong>Salvar Todos</strong> para adicionar novos contatos da rede em lote.</li>
+            <li>Para manter apenas usuários ativos na lista, a divulgação é pausada automaticamente — basta tocar em <strong>Reativar distribuição</strong> no app quando quiser continuar aparecendo.</li>
             <li>Exibe anúncios para manter o servidor gratuito.</li>
           </ul>
         </div>
         <div class="plan-card premium">
           <h3>★ Plano Premium</h3>
           <ul>
-            <li><strong>Ativo 24 horas:</strong> seu número não pausa à meia-noite e continua sendo distribuído todos os dias.</li>
+            <li><strong>Ativo 24 horas:</strong> seu número não pausa automaticamente e continua sendo distribuído todos os dias.</li>
             <li><strong>Salvar Individualmente:</strong> salve contatos específicos um a um quando quiser.</li>
             <li><strong>Filtros Exclusivos:</strong> salve contatos filtrados por <strong>Sexo</strong> ou por <strong>Estado / Região</strong>.</li>
             <li><strong>Destaque Dourado:</strong> seu perfil aparece com selo ★ PREMIUM em destaque na lista de contatos.</li>
@@ -338,12 +366,10 @@
     <section id="privacidade-suporte" class="card">
       <h2>4. Privacidade, Controle e Suporte</h2>
       <div class="highlight-box">
-        <strong>Você está sempre no controle:</strong> na aba <em>Ajustes</em> do aplicativo você pode
-        <strong>pausar</strong> o compartilhamento do seu número a qualquer momento ou <strong>excluir sua conta</strong>
-        definitivamente em conformidade com a LGPD.
+        <strong>Você está sempre no controle:</strong> na aba <em>Ajustes</em> do aplicativo basta desmarcar a opção de exibição para <strong>remover ou pausar</strong> seu número imediatamente, ou <strong>excluir sua conta</strong> definitivamente em conformidade com a LGPD.
       </div>
       <p>
-        O aplicativo <strong>não</strong> lê suas conversas privadas, <strong>não</strong> acessa sua agenda pessoal
+        O aplicativo <strong>não</strong> lê suas conversas privadas, <strong>não</strong> altera contatos existentes
         sem autorização e não possui vínculo oficial com o WhatsApp LLC ou a Meta Platforms, Inc.
       </p>
       <p>
